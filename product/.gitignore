@@ -1,0 +1,20 @@
+product/.env
+backend/node_modules/
+backend/package-lock.json
+backend/packaging/
+desktop/node_modules/
+desktop/dist/
+desktop/package-lock.json
+desktop/packaging-resources/
+*.log
+
+# windows-hub / nested build & deps
+windows-hub/node_modules/
+windows-hub/**/bin/
+windows-hub/**/obj/
+windows-hub/publish-local-x64/
+windows-hub/Output/
+windows-hub/.vs/
+desktop/dist/
+.git.bak-upload/
+**/.git.bak-upload/
