@@ -23,6 +23,8 @@ public sealed class ComposerSessionPickerTests
         Assert.Contains("var sessionRows = new List<Element?>();", composer);
         Assert.Contains("var channelFlyout = ContentFlyout(", composer);
         Assert.Contains("var channelPicker = PickerButton(", composer);
+        Assert.Contains("ChatNewSessionButton", composer);
+        Assert.Contains("OnNewSession", composer);
     }
 
     [Fact]

@@ -970,9 +970,22 @@ public sealed partial class TrayMenuWindow : WindowEx
         // Measure the full XAML root at the width it will actually receive.
         // This lets the platform account for Border, ScrollViewer, padding, and
         // any text wrapping caused by the final client width.
-        RootGrid.Measure(new global::Windows.Foundation.Size(clientWidthViewUnits, double.PositiveInfinity));
+        double desiredHeightViewUnits;
+        try
+        {
+            RootGrid.Measure(new global::Windows.Foundation.Size(clientWidthViewUnits, double.PositiveInfinity));
+            desiredHeightViewUnits = RootGrid.DesiredSize.Height;
+        }
+        catch (Exception ex)
+        {
+            // Chat LayoutCycleException / HRESULT 0x88000FA8 can leave the XAML
+            // tree unable to measure. Fall back to a fixed popup size so the
+            // tray menu (and Exit) still appears instead of a white hung window.
+            OpenClawTray.Services.Logger.Warn($"[TrayMenu] Measure failed, using fallback size: {ex.Message}");
+            desiredHeightViewUnits = MinimumMenuHeightViewUnits * 3;
+        }
 
-        var desiredClientHeightPx = MenuSizingHelper.ConvertViewUnitsToPixels(RootGrid.DesiredSize.Height, dpi);
+        var desiredClientHeightPx = MenuSizingHelper.ConvertViewUnitsToPixels(desiredHeightViewUnits, dpi);
         var desiredWindowHeightPx = Math.Max(1, desiredClientHeightPx + nonClientSize.Height);
         var minimumHeightPx = MenuSizingHelper.ConvertViewUnitsToPixels(MinimumMenuHeightViewUnits, dpi);
 
@@ -1032,6 +1045,13 @@ public sealed partial class TrayMenuWindow : WindowEx
         RootGrid.InvalidateArrange();
         MenuPanel.InvalidateMeasure();
         MenuPanel.InvalidateArrange();
+        // After LayoutCycleException, UpdateLayout on the tray tree throws HRESULT
+        // 0x88000FA8 in a loop and paints a white dead popup. Measure-only is enough.
+        if (App.Current is App app && app.HadRecentLayoutCycleFault())
+        {
+            OpenClawTray.Services.Logger.Warn("[TrayMenu] Skipping UpdateLayout after recent layout cycle");
+            return;
+        }
         try
         {
             RootGrid.UpdateLayout();

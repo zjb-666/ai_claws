@@ -61,6 +61,7 @@ public sealed class OpenClawChatRoot : Component
     private Action? _scrollToBottomToken;
     private Action<string>? _selectThread;
     private string? _pendingSelectedThreadId;
+    private string? _pendingNewParentSessionKey;
     /// <summary>
     /// Programmatically start voice recording from outside the composer.
     /// Set by the composer during render.
@@ -177,6 +178,9 @@ public sealed class OpenClawChatRoot : Component
             _pendingSelectedThreadId = threadId;
             selectedIdState.Set(threadId);
             selectedIdRef.Current = threadId;
+            if (_provider is OpenClawChatDataProvider native
+                && !ChatPendingNewSession.IsPendingKey(threadId))
+                native.RememberSelectedThread(threadId);
         };
 
         UseEffect((Func<Action>)(() =>
@@ -278,15 +282,14 @@ public sealed class OpenClawChatRoot : Component
         // If no real session is selected yet but the provider exposes a ready
         // compose target (gateway connected + handshake snapshot resolved),
         // synthesize a transient compose-only ChatThread so the composer is
-        // visible from the welcome screen. The synthetic thread's Id is the
-        // canonical compose key — so when the gateway materializes the session
-        // and SessionsUpdated arrives, Threads contains a real entry with the
-        // same Id and `selectedThread` resolves to it on the next render
-        // without any re-keying or migration.
+        // visible from the welcome screen. Pending-new keys are also compose-
+        // only until the first send commits sessions.create.
         ChatThread? composeOnlyThread = null;
-        var pendingComposeKey = ChatLifecycleSelectionPolicy.RetainPendingForSelection(
-            _pendingSelectedThreadId,
-            selectedIdState.Value);
+        var pendingComposeKey =
+            (ChatPendingNewSession.IsPendingKey(selectedIdState.Value) ? selectedIdState.Value : null)
+            ?? ChatLifecycleSelectionPolicy.RetainPendingForSelection(
+                _pendingSelectedThreadId,
+                selectedIdState.Value);
         var composeKey = pendingComposeKey ??
             (snapshot.ComposeTarget.IsReady ? snapshot.ComposeTarget.SessionKey : null);
         if (selectedThread is null && composeKey is not null)
@@ -295,11 +298,12 @@ public sealed class OpenClawChatRoot : Component
             // the previous session title/model while reconnecting instead of
             // generic "Main session"/"model" placeholders.
             var lastState = (_provider as OpenClawChatDataProvider)?.CachedLastChatState;
+            var isPendingNewCompose = ChatPendingNewSession.IsPendingKey(composeKey);
             composeOnlyThread = new ChatThread
             {
                 Id = composeKey,
                 AgentId = snapshot.ComposeTarget.AgentId,
-                Title = _pendingSelectedThreadId is not null
+                Title = isPendingNewCompose || _pendingSelectedThreadId is not null
                     ? LocalizationHelper.GetString("Chat_PendingNewSessionTitle")
                     : lastState?.ThreadTitle ?? "聚元灵创",
                 Model = lastState?.Model,
@@ -333,9 +337,12 @@ public sealed class OpenClawChatRoot : Component
 
         // Pull the timeline from the effective thread (so optimistic entries
         // from a pre-materialization first send are visible immediately).
+        var isPendingNew = ChatPendingNewSession.IsPendingKey(effectiveThread?.Id);
         var timeline = effectiveThread is not null && snapshot.Timelines.TryGetValue(effectiveThread.Id, out var tl)
             ? tl
             : ChatTimelineState.Initial();
+        if (isPendingNew && !timeline.HistoryLoaded)
+            timeline = timeline with { HistoryLoaded = true };
         var timelineGeneration = 0L;
         if (effectiveThread is not null
             && snapshot.TimelineGenerations is { } generations
@@ -447,7 +454,8 @@ public sealed class OpenClawChatRoot : Component
         var welcomeEligibleRaw = isEmptyConversation
             && gatewayConnected
             && (
-                (isComposeOnlyThread && !hasRealThreads)
+                isPendingNew
+                || (isComposeOnlyThread && !hasRealThreads)
                 || (!isComposeOnlyThread && timeline.HistoryLoaded)
             );
 
@@ -498,7 +506,8 @@ public sealed class OpenClawChatRoot : Component
             timeline.HistoryLoaded,
             hasRealThreads);
 
-        var emptyConversationIsAuthoritative = welcomeEligibleRaw && welcomeSettledState.Value;
+        var emptyConversationIsAuthoritative = welcomeEligibleRaw
+            && (isPendingNew || welcomeSettledState.Value);
 
         var timelineProps = new OpenClawChatTimelineProps(
             SessionId: effectiveThread?.Id,
@@ -521,6 +530,9 @@ public sealed class OpenClawChatRoot : Component
             ScrollToBottomToken: scrollToBottomToken.Value,
             OnPermissionResponse: effectiveThread?.Id is { } permissionThreadId
                 ? (rid, action) => OnPermission(permissionThreadId, rid, action)
+                : null,
+            OnNewSession: effectiveThread?.Id is { } newSessionThreadId
+                ? () => StartNewSession(newSessionThreadId)
                 : null);
 
         var bodyIsSkeleton = effectiveThread is null
@@ -633,6 +645,7 @@ public sealed class OpenClawChatRoot : Component
                 AvailableCommands: snapshot.AvailableCommands,
                 CommandsSupported: snapshot.CommandsSupported,
                 OnCommandsRequested: () => RunFireAndForget(ct => _provider.EnsureCommandCatalogAsync(ct)),
+                OnNewSession: () => StartNewSession(composerThread.Id!),
 #if !OPENCLAW_TRAY_TESTS
                 // Product: never feed SizeChanged → AvailableHeight → remount.
                 // That loop LayoutCycleExceptions after the first streamed reply.
@@ -703,6 +716,13 @@ public sealed class OpenClawChatRoot : Component
             composer.Grid(row: 3, column: 0)
         ).OnMount(root =>
         {
+#if !OPENCLAW_TRAY_TESTS
+            // Product builds never feed AvailableHeight; skip SizeChanged so a
+            // resize/stream cannot even queue the remount path that used to
+            // LayoutCycleException after the first streamed reply.
+            if (ProductBillingGate.IsLocked)
+                return;
+#endif
             void ApplyHeight(double height)
             {
                 if (root.DispatcherQueue is null || root.DispatcherQueue.HasThreadAccess)
@@ -843,6 +863,12 @@ public sealed class OpenClawChatRoot : Component
         if (_provider is OpenClawChatDataProvider native &&
             ChatLifecycleCommandParser.TryParse(message, attachments.Count > 0, out var command))
         {
+            if (command == ChatLifecycleCommandKind.New)
+            {
+                StartNewSession(threadId);
+                return true;
+            }
+
             if (ChatLifecycleCommandExecutionPolicy.ShouldQueue(command))
                 return await native.EnqueueCompactCommandAsync(threadId);
 
@@ -859,12 +885,39 @@ public sealed class OpenClawChatRoot : Component
             return result.Succeeded;
         }
 
+        if (attachments.Count == 0 && ChannelSetupIntent.TryParse(message, out var channelId))
+        {
+            (App.Current as App)?.StartChannelSetupWizard(channelId);
+            return true;
+        }
+
         try
         {
+            var sendThreadId = threadId;
+            if (ChatPendingNewSession.IsPendingKey(threadId))
+            {
+                if (_provider is not OpenClawChatDataProvider pendingNative)
+                    return false;
+
+                var parentKey = _pendingNewParentSessionKey;
+                if (string.IsNullOrWhiteSpace(parentKey))
+                    return false;
+
+                var created = await pendingNative.ExecuteLifecycleCommandAsync(
+                    parentKey,
+                    ChatLifecycleCommandKind.New).ConfigureAwait(false);
+                if (!created.Succeeded || created.NewSessionKey is not { } newSessionKey)
+                    return false;
+
+                _pendingNewParentSessionKey = null;
+                _selectThread?.Invoke(newSessionKey);
+                sendThreadId = newSessionKey;
+            }
+
             if (attachments.Count > 0)
-                await _provider.SendMessageAsync(threadId, message, CancellationToken.None, attachments.ToArray());
+                await _provider.SendMessageAsync(sendThreadId, message, CancellationToken.None, attachments.ToArray());
             else
-                await _provider.SendMessageAsync(threadId, message);
+                await _provider.SendMessageAsync(sendThreadId, message);
         }
         catch (Exception ex)
         {
@@ -872,6 +925,14 @@ public sealed class OpenClawChatRoot : Component
             return false;
         }
         return true;
+    }
+
+    private void StartNewSession(string threadId)
+    {
+        // ClawWork-style pending-new: clean empty page now; create on first send.
+        if (!ChatPendingNewSession.IsPendingKey(threadId))
+            _pendingNewParentSessionKey = threadId;
+        _selectThread?.Invoke(ChatPendingNewSession.AllocateKey());
     }
 
     private async Task SendSuggestionAsync(string threadId, string? displayName, string suggestion)

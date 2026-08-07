@@ -1,5 +1,5 @@
 ; 聚元灵创 Inno Setup Script (WinUI version)
-; Pass /DDevBuild=1 to produce a side-by-side dev installer.
+; Pass /DDevBuild=1 for LAN Dev, /DTestBuild=1 for staging/test-environment.
 #ifdef DevBuild
   #define MyAppName "聚元灵创 (Dev)"
   #define MyAppAumid "Juyuan.Lingchuang.Dev"
@@ -11,6 +11,17 @@
   #define MyDistroName "JuyuanLingchuangGateway-Dev"
   #define MyProtocol "juyuanlingchuang-dev"
   #define MyOutputSuffix "-Dev"
+#elif TestBuild
+  #define MyAppName "聚元灵创 (测试环境)"
+  #define MyAppAumid "Juyuan.Lingchuang.Test"
+  #define MyAppId "{{A8C4F1D2-6B3E-4F9A-9C21-7E5D8B0A4F16}"
+  #define MyInstallDir "JuyuanLingchuang-Test"
+  #define MyMutex "JuyuanLingchuang-Test"
+  #define MyAutoStartName "JuyuanLingchuang-Test"
+  #define MyStartupTaskName "聚元灵创 (测试环境)"
+  #define MyDistroName "JuyuanLingchuangGateway-Test"
+  #define MyProtocol "juyuanlingchuang-test"
+  #define MyOutputSuffix "-TestEnv"
 #else
   #define MyAppName "聚元灵创"
   #define MyAppAumid "Juyuan.Lingchuang"

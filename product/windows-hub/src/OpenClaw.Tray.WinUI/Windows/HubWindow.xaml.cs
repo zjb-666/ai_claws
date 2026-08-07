@@ -806,6 +806,16 @@ public sealed partial class HubWindow : WindowEx
     /// <summary>Returns the currently displayed page in the content frame.</summary>
     public object? CurrentPage => ContentFrame?.Content;
 
+    /// <summary>
+    /// Rebuild the native chat visual tree after a WinUI LayoutCycleException.
+    /// Safe to call when Chat is not the current page (no-op).
+    /// </summary>
+    public void RemountChatAfterLayoutFault()
+    {
+        if (CurrentPage is ChatPage chatPage)
+            chatPage.RemountChatAfterLayoutFault();
+    }
+
     // Canonical tag of the page currently shown in ContentFrame; tracked here
     // (rather than relying on NavView.SelectedItem) so navigation identity
     // includes the tag — important for agent-scoped pages where several tags

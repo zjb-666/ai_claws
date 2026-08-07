@@ -39,6 +39,7 @@ using Updatum;
 using WinUIEx;
 using SetupCompletedEventArgs = OpenClaw.SetupEngine.UI.SetupCompletedEventArgs;
 using SetupWindow = OpenClaw.SetupEngine.UI.SetupWindow;
+using ChannelSetupWizardWindow = OpenClaw.SetupEngine.UI.ChannelSetupWizardWindow;
 
 namespace OpenClawTray;
 
@@ -376,11 +377,112 @@ public partial class App : Application, OpenClawTray.Services.IAppCommands
         }
     }
 
+    private int _layoutCycleRecoveryScheduled;
+    private long _lastLayoutCycleTicks;
+    private int _layoutCycleRecoveryCount;
+    private long _layoutCycleRecoveryWindowStartTicks;
+
     private void OnUnhandledException(object sender, Microsoft.UI.Xaml.UnhandledExceptionEventArgs e)
     {
         _crashLogger.Log("UnhandledException", e.Exception);
         e.Handled = true; // Try to prevent crash
+
+        // LayoutCycleException from chat can poison shared WinUI layout state so the
+        // tray menu paints white with no Exit. Schedule a one-shot emergency recreate
+        // of tray + chat surface — user must not need Task Manager.
+        if (e.Exception is null)
+            return;
+        var name = e.Exception.GetType().Name;
+        var msg = e.Exception.Message ?? string.Empty;
+        if (!name.Contains("LayoutCycle", StringComparison.OrdinalIgnoreCase)
+            && !msg.Contains("Layout cycle", StringComparison.OrdinalIgnoreCase)
+            && e.Exception.HResult != unchecked((int)0x88000FA8))
+            return;
+
+        _lastLayoutCycleTicks = Environment.TickCount64;
+        // Coalesce storms: only one recovery pipeline at a time.
+        if (Interlocked.Exchange(ref _layoutCycleRecoveryScheduled, 1) != 0)
+            return;
+
+        try
+        {
+            // Defer past the broken layout pass; Low priority avoids re-entering measure.
+            _ = _dispatcherQueue?.TryEnqueue(
+                Microsoft.UI.Dispatching.DispatcherQueuePriority.Low,
+                () =>
+                {
+                    try
+                    {
+                        RecoverUiAfterLayoutCycle();
+                    }
+                    finally
+                    {
+                        Interlocked.Exchange(ref _layoutCycleRecoveryScheduled, 0);
+                    }
+                });
+        }
+        catch
+        {
+            Interlocked.Exchange(ref _layoutCycleRecoveryScheduled, 0);
+        }
     }
+
+    private void RecoverUiAfterLayoutCycle()
+    {
+        var now = Environment.TickCount64;
+        if (_layoutCycleRecoveryWindowStartTicks == 0 ||
+            now - _layoutCycleRecoveryWindowStartTicks > 20_000)
+        {
+            _layoutCycleRecoveryWindowStartTicks = now;
+            _layoutCycleRecoveryCount = 0;
+        }
+        _layoutCycleRecoveryCount++;
+
+        // NEVER remount chat after LayoutCycle. Remount tears down Reactor, loses
+        // in-memory timeline paint, and leaves Hub/Chat as a blank white shell
+        // ("Refreshing to (empty)" — openclaw-tray.log 2026-08-07 13:46). Tray-only.
+        Logger.Warn(
+            $"[App] Layout cycle recovery #{_layoutCycleRecoveryCount}: recreating tray menu only (chat remount disabled)");
+
+        try
+        {
+            if (_trayMenuWindow != null)
+            {
+                try { _trayMenuWindow.HideCascade(); } catch { /* poisoned */ }
+                _trayMenuWindow.MenuItemClicked -= OnTrayMenuItemClicked;
+                try { _trayMenuWindow.Close(); } catch { /* poisoned */ }
+                _trayMenuWindow = null;
+            }
+            InitializeTrayMenuWindow();
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn($"[App] Tray recreate after layout cycle failed: {ex.Message}");
+        }
+
+        // Keep Hub visible if it is already open; do not remount its chat tree.
+        try
+        {
+            if (_hubWindow is { IsClosed: false })
+                _hubWindow.Activate();
+        }
+        catch (Exception hubEx)
+        {
+            Logger.Warn($"[App] Hub activate after layout cycle failed: {hubEx.Message}");
+        }
+    }
+
+    private bool HadRecentLayoutCycle(int withinMs = 15_000)
+    {
+        if (_lastLayoutCycleTicks == 0)
+            return false;
+        var delta = Environment.TickCount64 - _lastLayoutCycleTicks;
+        return delta >= 0 && delta <= withinMs;
+    }
+
+    /// <summary>Used by tray sizing to skip UpdateLayout after a layout poison.</summary>
+    internal bool HadRecentLayoutCycleFault(int withinMs = 15_000) =>
+        HadRecentLayoutCycle(withinMs);
 
     /// <summary>
     /// Returns true if <paramref name="arg"/> is a deep link for this build variant.
@@ -960,15 +1062,26 @@ public partial class App : Application, OpenClawTray.Services.IAppCommands
         Logger.Info("Application started (WinUI 3)");
     }
 
-    private Task<bool> ShowProductLoginAsync()
+    private async Task<bool> ShowProductLoginAsync()
     {
         if (_connectionManager is null || _gatewayRegistry is null)
         {
-            return Task.FromResult(false);
+            return false;
+        }
+
+        var config = ProductConfig.Load();
+        // Prefer silent resume so a tray restart is not blocked behind an unattended
+        // login WebView (which previously left Gateway disconnected after kill/restart).
+        if (await ProductSessionResume.TryResumeAsync(
+                config,
+                _connectionManager,
+                _gatewayRegistry,
+                new AppLogger()))
+        {
+            return true;
         }
 
         var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var config = ProductConfig.Load();
         var window = _productLoginWindow = new ProductLoginWindow(
             config,
             _connectionManager,
@@ -985,7 +1098,7 @@ public partial class App : Application, OpenClawTray.Services.IAppCommands
         ApplyThemePreference(window);
         window.CenterOnScreen();
         window.Activate();
-        return completion.Task;
+        return await completion.Task;
     }
 
     private void InitializeKeepAliveWindow()
@@ -1233,6 +1346,15 @@ public partial class App : Application, OpenClawTray.Services.IAppCommands
                 return;
             }
 
+            // After a recent layout poison, skip the full menu builder and show
+            // a minimal Exit menu so the tray never paints as a blank white box.
+            if (HadRecentLayoutCycle())
+            {
+                Logger.Warn("[App] Recent layout cycle — showing emergency tray menu");
+                RecreateEmergencyTrayMenu();
+                return;
+            }
+
             // Menu uses purely cached data — no gateway requests on open
             // Data stays fresh via WebSocket event stream (session/health broadcasts)
 
@@ -1253,7 +1375,62 @@ public partial class App : Application, OpenClawTray.Services.IAppCommands
         {
             _crashLogger.Log("ShowTrayMenuPopup", ex);
             Logger.Error($"Failed to show tray menu: {ex.Message}");
+            // After chat LayoutCycleException the existing menu XAML tree can be
+            // poisoned (white blank popup, no Exit). Recreate a minimal menu so
+            // the user can still open the hub or quit.
+            try
+            {
+                RecreateEmergencyTrayMenu();
+            }
+            catch (Exception recoveryEx)
+            {
+                _crashLogger.Log("ShowTrayMenuPopup.Recovery", recoveryEx);
+                Logger.Error($"Tray menu recovery failed: {recoveryEx.Message}");
+            }
         }
+    }
+
+    private void RecreateEmergencyTrayMenu()
+    {
+        try
+        {
+            if (_trayMenuWindow != null)
+            {
+                _trayMenuWindow.MenuItemClicked -= OnTrayMenuItemClicked;
+                try { _trayMenuWindow.Close(); } catch { /* already broken */ }
+                _trayMenuWindow = null;
+            }
+        }
+        catch
+        {
+            _trayMenuWindow = null;
+        }
+
+        InitializeTrayMenuWindow();
+        if (_trayMenuWindow == null)
+            return;
+
+        _trayMenuWindow.BeginUpdate();
+        try
+        {
+            _trayMenuWindow.ClearItems();
+            // Keep labels aligned with TrayMenuStateBuilder footer so recovery
+            // still looks familiar; avoid missing localization keys.
+            _trayMenuWindow.AddMenuItem(
+                "Companion Settings...",
+                "\uE713",
+                "companion");
+            _trayMenuWindow.AddMenuItem(
+                LocalizationHelper.GetString("Menu_Exit"),
+                "\uE711",
+                "exit");
+        }
+        finally
+        {
+            _trayMenuWindow.EndUpdate();
+        }
+
+        _trayMenuWindow.ShowAtCursor();
     }
 
     private void OnTrayMenuItemClicked(object? sender, string action)
@@ -3404,6 +3581,23 @@ public partial class App : Application, OpenClawTray.Services.IAppCommands
 
     #region Window Management
 
+    /// <summary>
+    /// Opens the official gateway channel-setup wizard (same RPC as Control UI:
+    /// <c>wizard.start { flow: "channels" }</c>). Used by chat intent and the
+    /// Channels page so users are not pushed into an agent tool loop.
+    /// </summary>
+    internal void StartChannelSetupWizard(string? channelId = null)
+    {
+        try
+        {
+            ChannelSetupWizardWindow.ShowOrActivate(channelId);
+        }
+        catch (Exception ex)
+        {
+            Logger.Error($"Failed to open channel setup wizard: {ex}");
+        }
+    }
+
     internal void ShowHub(string? navigateTo = null, bool activate = true)
     {
         if (_hubWindow == null || _hubWindow.IsClosed)
@@ -4221,12 +4415,6 @@ public partial class App : Application, OpenClawTray.Services.IAppCommands
 
     private void CheckForProductUpdates()
     {
-        if (ProductUpdatesEnabled)
-        {
-            _ = _updateCoordinator!.CheckForUpdatesUserInitiatedAsync();
-            return;
-        }
-
         ShowTransientConnectionError("当前版本暂不支持自动更新，请联系聚元灵创管理员获取新版安装包。");
     }
 

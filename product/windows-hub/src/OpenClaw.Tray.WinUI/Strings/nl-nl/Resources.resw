@@ -2854,6 +2854,12 @@ Gebruik een van deze opties:
   <data name="Chat_PendingNewSessionTitle" xml:space="preserve">
     <value>Nieuwe sessie</value>
   </data>
+  <data name="Chat_Composer_Tooltip_NewSession" xml:space="preserve">
+    <value>Nieuwe sessie</value>
+  </data>
+  <data name="Chat_Error_NewSessionAction" xml:space="preserve">
+    <value>Nieuwe sessie</value>
+  </data>
   <data name="Chat_Status_Running" xml:space="preserve">
     <value>Bezig</value>
   </data>
@@ -3670,6 +3676,12 @@ Opdrachten worden geblokkeerd zolang sandboxing niet beschikbaar is, omdat strik
   </data>
   <data name="ChannelsPage_Refresh.Text" xml:space="preserve">
     <value>Vernieuwen</value>
+  </data>
+  <data name="ChannelsPage_SetupWizard.Text" xml:space="preserve">
+    <value>Installatiewizard</value>
+  </data>
+  <data name="ChannelsPage_OpenSetupWizard" xml:space="preserve">
+    <value>Officiële installatiewizard openen</value>
   </data>
   <data name="ChannelsPage_ConfiguredHeader.Text" xml:space="preserve">
     <value>GECONFIGUREERD</value>

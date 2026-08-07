@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -145,6 +146,11 @@ public sealed class OpenClawChatDataProvider : IChatDataProvider
     // Track recently-sent local user message texts so we can suppress
     // SSE echoes while still displaying messages from other clients.
     private readonly Dictionary<string, Queue<LocalSentText>> _localSentTexts = new();
+    // After a local echo is matched once, gateway product retries can re-emit
+    // the same user chat.message (~seconds later). Remember consumed texts so
+    // those re-emits do not create a second bubble; remote same-text after the
+    // window still renders (see UserEcho_DoesNotReconcileStale...).
+    private readonly Dictionary<string, Dictionary<string, Queue<DateTimeOffset>>> _consumedLocalEchoTexts = new();
     private readonly Dictionary<string, List<ChatQueuedMessage>> _queuedMessages = new();
     private readonly Dictionary<string, List<QueuedSendRequest>> _queuedSendRequests = new();
     private readonly Dictionary<string, Dictionary<string, string>> _queuedMessageIdsByRunId = new();
@@ -2089,6 +2095,7 @@ public sealed class OpenClawChatDataProvider : IChatDataProvider
             _queuedMessageIdsByRunId.Clear();
             _terminalRunIdsByThread.Clear();
             _localSentTexts.Clear();
+            _consumedLocalEchoTexts.Clear();
             _locallyInitiatedThreads.Clear();
             _resetSubmittedLocalEchoTexts.Clear();
         }
@@ -2179,6 +2186,7 @@ public sealed class OpenClawChatDataProvider : IChatDataProvider
                 historyGenerationToCancel = AdvanceHistoryGenerationLocked(clearLoaded: true);
                 _locallyInitiatedThreads.Clear();
                 _localSentTexts.Clear();
+                _consumedLocalEchoTexts.Clear();
                 _queuedMessages.Clear();
                 _queuedSendRequests.Clear();
                 _queuedDrainScheduledThreads.Clear();
@@ -2663,11 +2671,15 @@ public sealed class OpenClawChatDataProvider : IChatDataProvider
             }
 
             // Not a local echo — show it as a user message from another client.
+            // Product Hub: after the first echo is consumed, a second agent run
+            // can re-emit the same user chat.message; suppress those within the
+            // local-echo window so one send does not render two bubbles.
             if (!string.IsNullOrEmpty(message.Text))
             {
                 var userText = TruncateForChatEntry(EscapeUntrustedAttachmentMarkerLines(message.Text));
                 ChatEntryMetadata? userMeta;
                 ChatDataSnapshot? reconciledLocalQueuedSnapshot = null;
+                var suppressConsumedEcho = false;
                 lock (_gate)
                 {
                     userMeta = BuildLiveMetaLocked(
@@ -2677,10 +2689,19 @@ public sealed class OpenClawChatDataProvider : IChatDataProvider
                         message.OpenClawSeq);
                     if (TryReconcileExistingLocalQueuedUserEchoLocked(msgThreadId, userText, userMeta))
                         reconciledLocalQueuedSnapshot = BuildSnapshotLocked();
+                    else if (TrySuppressAlreadyConsumedLocalUserEchoLocked(msgThreadId, echoText, message.Ts))
+                        suppressConsumedEcho = true;
                 }
                 if (reconciledLocalQueuedSnapshot is not null)
                 {
                     Publish(reconciledLocalQueuedSnapshot);
+                    return;
+                }
+
+                if (suppressConsumedEcho)
+                {
+                    Logger.Info(
+                        $"[ChatProvider] Suppressed duplicate user echo after consumed local send threadId='{msgThreadId}' len={echoText.Length}");
                     return;
                 }
 
@@ -2739,11 +2760,30 @@ public sealed class OpenClawChatDataProvider : IChatDataProvider
         if (IsGatewayAgentRunFailureStub(message.Text))
         {
             var failThread = message.SessionKey;
+            var mappedFailure = ProductPlatformBilling.MapUserFacingErrorOrOriginal(message.Text);
             ChatEntryMetadata? failMeta;
-            lock (_gate) { failMeta = BuildLiveMetaLocked(failThread, message.Ts, message.OpenClawId, message.OpenClawSeq); }
+            var skipDuplicate = false;
+            lock (_gate)
+            {
+                failMeta = BuildLiveMetaLocked(failThread, message.Ts, message.OpenClawId, message.OpenClawSeq);
+                skipDuplicate = TimelineHasRecentIdenticalErrorLocked(failThread, mappedFailure);
+            }
+            if (skipDuplicate)
+            {
+                Logger.Debug($"[ChatProvider] Suppressed duplicate agent-failure stub on thread='{failThread}'");
+                bool endTurn;
+                lock (_gate)
+                {
+                    endTurn = _timelines.TryGetValue(failThread, out var tl) && tl.TurnActive;
+                }
+                if (endTurn)
+                    ApplyEventAndPublish(failThread, new ChatTurnEndEvent());
+                return;
+            }
+
             ApplyEventAndPublish(
                 failThread,
-                new ChatErrorEvent(ProductPlatformBilling.MapUserFacingErrorOrOriginal(message.Text)),
+                new ChatErrorEvent(mappedFailure),
                 failMeta);
             return;
         }
@@ -3074,11 +3114,66 @@ public sealed class OpenClawChatDataProvider : IChatDataProvider
         // AgentEventInfo.Ts is a double of unix-epoch ms (per OpenClawGatewayClient).
         var tsMs = evt.Ts > 0 ? (long)evt.Ts : 0L;
         ChatEntryMetadata? meta;
-        lock (_gate) { meta = BuildLiveMetaLocked(threadId, tsMs); }
+        var skipDuplicateError = false;
+        lock (_gate)
+        {
+            meta = BuildLiveMetaLocked(threadId, tsMs);
+            if (mapped is ChatErrorEvent errorEvt)
+                skipDuplicateError = TimelineHasRecentIdenticalErrorLocked(threadId, errorEvt.Text);
+        }
+
+        if (skipDuplicateError)
+        {
+            Logger.Debug($"[ChatProvider] Suppressed duplicate lifecycle error on thread='{threadId}'");
+            // A later lifecycle.start re-opens TurnActive. Skipping the twin
+            // ChatErrorEvent would otherwise leave the thinking state stuck
+            // because ChatErrorEvent is what normally ApplyTurnEnds the turn.
+            if (mapped is ChatErrorEvent)
+            {
+                bool endTurn;
+                lock (_gate)
+                {
+                    endTurn = _timelines.TryGetValue(threadId, out var tl) && tl.TurnActive;
+                }
+                if (endTurn)
+                    ApplyEventAndPublish(threadId, new ChatTurnEndEvent());
+            }
+            if (isTerminalRunEvent)
+                ScheduleQueuedSendDrain(threadId);
+            return;
+        }
 
         ApplyEventAndPublish(threadId, mapped, meta);
         if (isTerminalRunEvent)
             ScheduleQueuedSendDrain(threadId);
+    }
+
+    private bool TimelineHasRecentIdenticalErrorLocked(string threadId, string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text) ||
+            !_timelines.TryGetValue(threadId, out var timeline) ||
+            !_entryMeta.TryGetValue(threadId, out var threadMeta))
+        {
+            return false;
+        }
+
+        var normalized = text.Trim();
+        var now = DateTimeOffset.Now;
+        for (var i = timeline.Entries.Count - 1; i >= 0; i--)
+        {
+            var entry = timeline.Entries[i];
+            if (entry.Kind != ChatTimelineItemKind.Status || entry.Tone != ChatTone.Error)
+                continue;
+            if (!string.Equals(entry.Text?.Trim(), normalized, StringComparison.Ordinal))
+                continue;
+            // History / send-failure rows can lack entry meta. Do not treat
+            // those as "fresh" forever — only time-bounded matches suppress.
+            if (!threadMeta.TryGetValue(entry.Id, out var meta) || meta.Timestamp is not { } ts)
+                continue;
+            return (now - ts).Duration() <= LocalEchoSuppressionWindow;
+        }
+
+        return false;
     }
 
     private static ChatResponseOutputKind? ClassifyInboundOutput(
@@ -3170,7 +3265,8 @@ public sealed class OpenClawChatDataProvider : IChatDataProvider
                         // assistant/user dedup still collapses duplicate bubbles.
                         var suppressDuplicateProductLifecycle =
                             ProductBillingGate.IsLocked &&
-                            ShouldSuppressDuplicateProductRemoteLifecycleLocked(threadId);
+                            (_locallyInitiatedThreads.Contains(threadId) ||
+                             _assistantFallbackPromotedThreads.Contains(threadId));
                         if (suppressDuplicateProductLifecycle)
                         {
                             Logger.Warn(
@@ -3419,7 +3515,81 @@ public sealed class OpenClawChatDataProvider : IChatDataProvider
         }
 
         StoreLocalEchoQueueLocked(threadId, kept);
+        RememberConsumedLocalEchoTextLocked(threadId, text);
         return true;
+    }
+
+    private void RememberConsumedLocalEchoTextLocked(string threadId, string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return;
+
+        if (!_consumedLocalEchoTexts.TryGetValue(threadId, out var texts))
+        {
+            texts = new Dictionary<string, Queue<DateTimeOffset>>(StringComparer.Ordinal);
+            _consumedLocalEchoTexts[threadId] = texts;
+        }
+
+        var normalized = text.Trim();
+        if (!texts.TryGetValue(normalized, out var timestamps))
+        {
+            timestamps = new Queue<DateTimeOffset>();
+            texts[normalized] = timestamps;
+        }
+
+        timestamps.Enqueue(DateTimeOffset.UtcNow);
+        while (timestamps.Count > 0 &&
+               DateTimeOffset.UtcNow - timestamps.Peek() > LocalEchoSuppressionWindow)
+        {
+            timestamps.Dequeue();
+        }
+
+        if (timestamps.Count == 0)
+            texts.Remove(normalized);
+        if (texts.Count == 0)
+            _consumedLocalEchoTexts.Remove(threadId);
+    }
+
+    private bool TrySuppressAlreadyConsumedLocalUserEchoLocked(
+        string threadId,
+        string text,
+        long messageTsMs = 0)
+    {
+        if (string.IsNullOrWhiteSpace(text) ||
+            !_consumedLocalEchoTexts.TryGetValue(threadId, out var texts))
+        {
+            return false;
+        }
+
+        var normalized = text.Trim();
+        if (!texts.TryGetValue(normalized, out var timestamps))
+            return false;
+
+        var now = DateTimeOffset.UtcNow;
+        while (timestamps.Count > 0 && now - timestamps.Peek() > LocalEchoSuppressionWindow)
+            timestamps.Dequeue();
+
+        if (timestamps.Count == 0)
+        {
+            texts.Remove(normalized);
+            if (texts.Count == 0)
+                _consumedLocalEchoTexts.Remove(threadId);
+            return false;
+        }
+
+        // Prefer the gateway event timestamp when present so a later remote
+        // same-text message (outside the echo window) is not collapsed just
+        // because wall-clock delivery is still near the local send.
+        var messageTime = messageTsMs > 0
+            ? DateTimeOffset.FromUnixTimeMilliseconds(messageTsMs)
+            : now;
+        foreach (var consumedAt in timestamps)
+        {
+            if ((messageTime - consumedAt).Duration() <= LocalEchoSuppressionWindow)
+                return true;
+        }
+
+        return false;
     }
 
     private void StoreLocalEchoQueueLocked(string threadId, Queue<LocalSentText> queue)
@@ -4611,7 +4781,12 @@ public sealed class OpenClawChatDataProvider : IChatDataProvider
     {
         if (string.IsNullOrWhiteSpace(text))
             return false;
-        return text.Contains("agent run failed before producing a reply", StringComparison.OrdinalIgnoreCase);
+        // Gateway variants observed in the wild:
+        // - "agent run failed before producing a reply"
+        // - "Agent failed before reply: 503 chat completions unavailable"
+        // - "embedded agent failed before reply: ..."
+        return text.Contains("agent run failed before producing a reply", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("failed before reply", StringComparison.OrdinalIgnoreCase);
     }
 
     private static ChatEvent? MapToolEvent(AgentEventInfo evt)
@@ -5095,6 +5270,201 @@ public sealed class OpenClawChatDataProvider : IChatDataProvider
     // SearchValues gives SIMD-accelerated scan without a per-call heap allocation.
     private static readonly SearchValues<char> s_seamPunctChars = SearchValues.Create(".!?:");
 
+    private static readonly string[] KnownToolNames =
+    {
+        "exec", "process", "read", "write", "edit", "apply_patch", "browser",
+        "web_fetch", "web_search", "memory_search", "memory_get",
+        "sessions_list", "sessions_history", "sessions_send", "sessions_spawn",
+        "sessions_yield", "session_status", "agents_list", "subagents", "cron",
+        "gateway", "nodes", "message", "tts", "image", "image_generate",
+        "music_generate", "video_generate", "pdf", "transcripts",
+        "skill_workshop", "get_goal", "create_goal", "update_goal", "update_plan",
+    };
+
+    private static readonly System.Text.RegularExpressions.Regex s_leakedToolCallBlock =
+        new(@"<tool_call\b[^>]*>[\s\S]*?</tool_call>",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase |
+            System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    private static readonly System.Text.RegularExpressions.Regex s_leakedToolCallTag =
+        new(@"</?(?:tool_call|function|arg_key|arg_value|parameter|tool_name)\b[^>]*>",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase |
+            System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    private static readonly System.Text.RegularExpressions.Regex s_leakedKnownToolBlock =
+        new(@"<(?:exec|process|read|write|edit|apply_patch|browser|web_fetch|web_search|memory_search|memory_get|sessions_list|sessions_history|sessions_send|sessions_spawn|sessions_yield|session_status|agents_list|subagents|cron|gateway|nodes|message|tts|image|image_generate|music_generate|video_generate|pdf|transcripts|skill_workshop|get_goal|create_goal|update_goal|update_plan)\b[^>]*>[\s\S]*?</(?:exec|process|read|write|edit|apply_patch|browser|web_fetch|web_search|memory_search|memory_get|sessions_list|sessions_history|sessions_send|sessions_spawn|sessions_yield|session_status|agents_list|subagents|cron|gateway|nodes|message|tts|image|image_generate|music_generate|video_generate|pdf|transcripts|skill_workshop|get_goal|create_goal|update_goal|update_plan)>",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase |
+            System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    private static readonly System.Text.RegularExpressions.Regex s_leakedToolBlock =
+        new(@"<tool\b[^>]*>[\s\S]*?</tool>",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase |
+            System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    private static readonly System.Text.RegularExpressions.Regex s_leakedFunctionEqBlock =
+        new(@"<function=[^>]*>[\s\S]*?(?:</function>|(?=<tool_call\b)|$)",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase |
+            System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    /// <summary>
+    /// Removes leaked JuYuan/Qwen tool XML that the model sometimes leaves in
+    /// assistant text after a partial or mis-shaped tool promotion.
+    /// Covers every known agent tool root tag, not just exec/read.
+    /// </summary>
+    internal static string StripLeakedToolCallMarkup(string? text)
+    {
+        if (string.IsNullOrEmpty(text))
+            return text ?? string.Empty;
+
+        var cleaned = text;
+        if (cleaned.IndexOf('<') >= 0)
+        {
+            cleaned = s_leakedToolCallBlock.Replace(cleaned, string.Empty);
+            cleaned = s_leakedToolBlock.Replace(cleaned, string.Empty);
+            cleaned = s_leakedKnownToolBlock.Replace(cleaned, string.Empty);
+            cleaned = s_leakedFunctionEqBlock.Replace(cleaned, string.Empty);
+            cleaned = s_leakedToolCallTag.Replace(cleaned, string.Empty);
+            // Drop orphaned known tool open/close tags if any remain.
+            foreach (var tool in KnownToolNames)
+            {
+                cleaned = System.Text.RegularExpressions.Regex.Replace(
+                    cleaned,
+                    $@"</?{System.Text.RegularExpressions.Regex.Escape(tool)}\b[^>]*>",
+                    string.Empty,
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            }
+        }
+
+        cleaned = StripLeakedToolResultDumps(cleaned);
+        cleaned = System.Text.RegularExpressions.Regex.Replace(cleaned, @"\n{3,}", "\n\n");
+        return cleaned.Trim();
+    }
+
+    /// <summary>
+    /// Models sometimes paste tool *results* into assistant prose as
+    /// <c>tool: { "ok": true, "result": … }</c> and stop. Strip those
+    /// envelopes so the bubble keeps only human-readable text.
+    /// </summary>
+    internal static string StripLeakedToolResultDumps(string? text)
+    {
+        if (string.IsNullOrEmpty(text))
+            return text ?? string.Empty;
+        if (text.IndexOf('{') < 0)
+            return text;
+        if (text.IndexOf("tool", System.StringComparison.OrdinalIgnoreCase) < 0 &&
+            text.IndexOf("\"ok\"", System.StringComparison.Ordinal) < 0)
+            return text;
+
+        var cleaned = text;
+        var prefixRe = new System.Text.RegularExpressions.Regex(
+            @"(?:^|[\s\u3000。．.!！?？:：;；])(?:🛠️\s*)?(?:tool(?:\s*[-_]?\s*result)?|function(?:\s*[-_]?\s*result)?)\s*:\s*\{",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase |
+            System.Text.RegularExpressions.RegexOptions.Compiled);
+
+        // Collect [start, end) ranges to remove (from the "tool" token, not the lead punct).
+        var ranges = new List<(int Start, int End)>();
+        foreach (System.Text.RegularExpressions.Match m in prefixRe.Matches(cleaned))
+        {
+            int openBrace = m.Index + m.Length - 1;
+            if (openBrace < 0 || openBrace >= cleaned.Length || cleaned[openBrace] != '{')
+                continue;
+            int end = FindJsonObjectEnd(cleaned, openBrace);
+            if (end < 0)
+                continue;
+            string json = cleaned.Substring(openBrace, end - openBrace);
+            if (!LooksLikeToolResultEnvelope(json))
+                continue;
+            int start = m.Index;
+            // Skip leading punctuation/whitespace captured by the prefix.
+            while (start < openBrace &&
+                   (char.IsWhiteSpace(cleaned[start]) ||
+                    "。．.!！?？:：;；\u3000".IndexOf(cleaned[start]) >= 0))
+                start++;
+            ranges.Add((start, end));
+        }
+
+        if (ranges.Count == 0)
+        {
+            // Trailing bare {"ok":true,"result":...}
+            int probe = cleaned.IndexOf("{\"ok\"", System.StringComparison.Ordinal);
+            if (probe < 0)
+                probe = cleaned.IndexOf("{ \"ok\"", System.StringComparison.Ordinal);
+            if (probe >= 0)
+            {
+                int openBrace = cleaned.IndexOf('{', probe);
+                int end = FindJsonObjectEnd(cleaned, openBrace);
+                if (end > 0 && end >= cleaned.TrimEnd().Length)
+                {
+                    string json = cleaned.Substring(openBrace, end - openBrace);
+                    if (LooksLikeToolResultEnvelope(json))
+                    {
+                        string before = cleaned.Substring(0, openBrace).TrimEnd();
+                        if (before.Length == 0 || cleaned.Substring(0, openBrace).EndsWith('\n') ||
+                            cleaned.Substring(0, openBrace).TrimEnd().Length < cleaned.Substring(0, openBrace).Length)
+                            ranges.Add((openBrace, end));
+                    }
+                }
+            }
+        }
+
+        if (ranges.Count == 0)
+            return text;
+
+        ranges.Sort((a, b) => b.Start.CompareTo(a.Start));
+        foreach (var (start, end) in ranges)
+            cleaned = cleaned.Remove(start, end - start);
+
+        return cleaned.Trim();
+    }
+
+    private static bool LooksLikeToolResultEnvelope(string json)
+    {
+        try
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(json);
+            if (doc.RootElement.ValueKind != System.Text.Json.JsonValueKind.Object)
+                return false;
+            if (!doc.RootElement.TryGetProperty("ok", out _))
+                return false;
+            return doc.RootElement.TryGetProperty("result", out _) ||
+                   doc.RootElement.TryGetProperty("error", out _) ||
+                   doc.RootElement.TryGetProperty("details", out _);
+        }
+        catch (System.Text.Json.JsonException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>Returns the index just past a balanced JSON object starting at <paramref name="openBrace"/>, or -1.</summary>
+    private static int FindJsonObjectEnd(string text, int openBrace)
+    {
+        if (openBrace < 0 || openBrace >= text.Length || text[openBrace] != '{')
+            return -1;
+        int depth = 0;
+        bool inStr = false;
+        bool esc = false;
+        for (int i = openBrace; i < text.Length; i++)
+        {
+            char c = text[i];
+            if (inStr)
+            {
+                if (esc) esc = false;
+                else if (c == '\\') esc = true;
+                else if (c == '"') inStr = false;
+                continue;
+            }
+            if (c == '"') inStr = true;
+            else if (c == '{') depth++;
+            else if (c == '}')
+            {
+                depth--;
+                if (depth == 0) return i + 1;
+            }
+        }
+        return -1;
+    }
+
     /// <summary>
     /// Re-insert paragraph breaks at gateway-glued content-block seams in
     /// an assistant message. Safe to call on any text — short text, text
@@ -5105,6 +5475,11 @@ public sealed class OpenClawChatDataProvider : IChatDataProvider
     internal static string RepairContentBlockSeams(string? text)
     {
         if (string.IsNullOrEmpty(text)) return text ?? string.Empty;
+
+        // Defense-in-depth: never show raw JuYuan / Qwen tool XML in bubbles when
+        // the gateway/proxy failed to promote them into tool_calls.
+        text = StripLeakedToolCallMarkup(text);
+        if (string.IsNullOrEmpty(text)) return string.Empty;
         if (text.Length < 4) return text;
 
         // Fast path: if neither marker is present we can skip entirely.
@@ -5651,6 +6026,7 @@ public sealed class OpenClawChatDataProvider : IChatDataProvider
         _abortedThreads.Remove(threadId);
         _locallyInitiatedThreads.Remove(threadId);
         _localSentTexts.Remove(threadId);
+        _consumedLocalEchoTexts.Remove(threadId);
         _queuedMessages.Remove(threadId);
         _queuedSendRequests.Remove(threadId);
         ClearQueuedDrainScheduleLocked(threadId);

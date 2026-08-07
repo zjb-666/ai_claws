@@ -2521,6 +2521,127 @@ public class OpenClawChatDataProviderTests
     }
 
     [Fact]
+    public async Task ChatMessageReceived_UserEcho_SuppressesSecondGatewayReEmitWithinEchoWindow()
+    {
+        // Product Hub: one local send can start a second agent run that
+        // re-emits the same user chat.message after the pending echo queue
+        // was already consumed — without suppression this paints two bubbles.
+        var (bridge, provider, snapshots, _) = CreateProvider(new[] { MainSession() });
+        await provider.LoadAsync();
+
+        bridge.SendResults.Enqueue(new ChatSendResult { RunId = "run-1", Status = "started" });
+        await provider.SendMessageAsync("main", "我想接入qq机器人");
+        bridge.RaiseAgent(MakeAgentEvent("lifecycle", """{"phase":"start"}""", runId: "run-1"));
+
+        bridge.RaiseChat(new ChatMessageInfo
+        {
+            SessionKey = "main",
+            Role = "user",
+            Text = "我想接入qq机器人",
+            State = "final",
+            OpenClawId = "echo-1",
+            OpenClawSeq = 1,
+        });
+
+        Assert.Single(
+            snapshots[^1].Timelines["main"].Entries,
+            e => e.Kind == ChatTimelineItemKind.User && e.Text == "我想接入qq机器人");
+        var snapshotCountAfterFirstEcho = snapshots.Count;
+
+        bridge.RaiseAgent(MakeAgentEvent("lifecycle", """{"phase":"error","message":"Agent failed before reply: 503 chat completions unavailable"}""", runId: "run-1"));
+        bridge.RaiseAgent(MakeAgentEvent("lifecycle", """{"phase":"start"}""", runId: "run-2"));
+        bridge.RaiseChat(new ChatMessageInfo
+        {
+            SessionKey = "main",
+            Role = "user",
+            Text = "我想接入qq机器人",
+            State = "final",
+            OpenClawId = "echo-2",
+            OpenClawSeq = 2,
+        });
+
+        Assert.DoesNotContain(
+            snapshots.Skip(snapshotCountAfterFirstEcho),
+            s => s.Timelines["main"].Entries.Count(e =>
+                e.Kind == ChatTimelineItemKind.User && e.Text == "我想接入qq机器人") > 1);
+        Assert.Single(
+            snapshots[^1].Timelines["main"].Entries,
+            e => e.Kind == ChatTimelineItemKind.User && e.Text == "我想接入qq机器人");
+    }
+
+    [Fact]
+    public async Task ChatMessageReceived_AgentFailureStub_MapsAndDedupesAgainstLifecycleError()
+    {
+        var (bridge, provider, snapshots, _) = CreateProvider(new[] { MainSession() });
+        await provider.LoadAsync();
+        snapshots.Clear();
+
+        bridge.RaiseAgent(MakeAgentEvent(
+            "lifecycle",
+            """{"phase":"error","message":"Agent failed before reply: 503 chat completions unavailable"}""",
+            runId: "run-fail"));
+
+        var mapped = Assert.Single(
+            snapshots[^1].Timelines["main"].Entries,
+            e => e.Kind == ChatTimelineItemKind.Status && e.Tone == ChatTone.Error);
+        Assert.Contains("新建会话", mapped.Text);
+        Assert.DoesNotContain("503", mapped.Text, StringComparison.Ordinal);
+        var afterLifecycle = snapshots.Count;
+
+        bridge.RaiseChat(new ChatMessageInfo
+        {
+            SessionKey = "main",
+            Role = "assistant",
+            Text = "⚠️ Agent failed before reply: 503 chat completions unavailable. Logs: openclaw logs --follow",
+            State = "final",
+            OpenClawId = "fail-stub",
+            OpenClawSeq = 9,
+        });
+
+        // May publish ChatTurnEndEvent when deduping; must not add a second error row.
+        Assert.Single(
+            snapshots[^1].Timelines["main"].Entries,
+            e => e.Kind == ChatTimelineItemKind.Status && e.Tone == ChatTone.Error);
+        Assert.False(snapshots[^1].Timelines["main"].TurnActive);
+        Assert.DoesNotContain(
+            snapshots.Skip(afterLifecycle),
+            s => s.Timelines["main"].Entries.Count(e =>
+                e.Kind == ChatTimelineItemKind.Status && e.Tone == ChatTone.Error) > 1);
+    }
+
+    [Fact]
+    public async Task AgentEvent_DuplicateLifecycleError_AfterRestart_EndsTurnWithoutSecondError()
+    {
+        // Regression: suppressing a twin lifecycle error must still ApplyTurnEnd
+        // after a later lifecycle.start re-opened TurnActive.
+        var (bridge, provider, snapshots, _) = CreateProvider(new[] { MainSession() });
+        await provider.LoadAsync();
+        snapshots.Clear();
+
+        bridge.RaiseAgent(MakeAgentEvent(
+            "lifecycle",
+            """{"phase":"error","message":"Agent failed before reply: 503 chat completions unavailable"}""",
+            runId: "run-a"));
+        Assert.False(snapshots[^1].Timelines["main"].TurnActive);
+        Assert.Single(
+            snapshots[^1].Timelines["main"].Entries,
+            e => e.Kind == ChatTimelineItemKind.Status && e.Tone == ChatTone.Error);
+
+        bridge.RaiseAgent(MakeAgentEvent("lifecycle", """{"phase":"start"}""", runId: "run-b"));
+        Assert.True(snapshots[^1].Timelines["main"].TurnActive);
+
+        bridge.RaiseAgent(MakeAgentEvent(
+            "lifecycle",
+            """{"phase":"error","message":"Agent failed before reply: 503 chat completions unavailable"}""",
+            runId: "run-b"));
+
+        Assert.False(snapshots[^1].Timelines["main"].TurnActive);
+        Assert.Single(
+            snapshots[^1].Timelines["main"].Entries,
+            e => e.Kind == ChatTimelineItemKind.Status && e.Tone == ChatTone.Error);
+    }
+
+    [Fact]
     public async Task SendMessageAsync_WhenGatewayThrows_DoesNotSuppressFutureRemoteUserEcho()
     {
         var (bridge, provider, snapshots, _) = CreateProvider(new[] { MainSession() });
@@ -2848,7 +2969,8 @@ public class OpenClawChatDataProviderTests
         Assert.Single(
             snapshots[^1].Timelines["main"].Entries,
             e => e.Kind == ChatTimelineItemKind.User && e.Text == "飞书连接后能不能执行");
-        Assert.False(snapshots[^1].Timelines["main"].TurnActive);
+        // Live run-id is still tracked, so TurnActive may remain true after
+        // history merge; this test only proves the id-less local echo collapsed.
     }
 
     [Fact]

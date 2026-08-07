@@ -44,8 +44,12 @@ public static class ProductPlatformBilling
             return true;
         var slash = id.LastIndexOf('/');
         if (slash >= 0 && slash < id.Length - 1)
-            return AllowedModelIdSet.Contains(id[(slash + 1)..]);
-        return false;
+            id = id[(slash + 1)..];
+        if (AllowedModelIdSet.Contains(id))
+            return true;
+        // Display-name forms from UI / docs (qwen3.6-plus → qwen3_6_plus).
+        var wire = id.Replace('-', '_').Replace('.', '_');
+        return AllowedModelIdSet.Contains(wire);
     }
 
     public static ModelsListInfo FilterModelsList(ModelsListInfo? info)
@@ -107,9 +111,28 @@ public static class ProductPlatformBilling
             return "当前模型不在平台白名单内，请改用可用模型。";
         }
 
-        if (ContainsInsensitive(messageOrCode, "agent run failed before producing a reply"))
+        // Gateway often surfaces transport failures as "agent run failed before
+        // producing a reply". Prefer specific guidance when the payload already
+        // names 503 / 502 / timeout / unavailable — do NOT blame the model allowlist
+        // (users already on qwen3_6_plus were getting a false whitelist prompt).
+        // New-session alone does not fix outlet outages: brand-new Hub turns still
+        // ship ~20k+ bootstrap tokens and need a working LLM exit for tool loops.
+        if (ContainsInsensitive(messageOrCode, "503") ||
+            ContainsInsensitive(messageOrCode, "502") ||
+            ContainsInsensitive(messageOrCode, "chat completions unavailable") ||
+            ContainsInsensitive(messageOrCode, "failovererror") ||
+            ContainsInsensitive(messageOrCode, "fetch failed") ||
+            (ContainsInsensitive(messageOrCode, "timeout") &&
+             ContainsInsensitive(messageOrCode, "llm")))
         {
-            return "助手本次未能生成回复。请切换到白名单模型（如 qwen3_6_plus），或联系运维检查 Gateway 模型与算力出口。";
+            return "模型服务暂时不可用（网关或算力出口超时/繁忙/断连）。请稍后重试；「新建会话」清的是对话历史，出口不通时仍会失败。";
+        }
+
+        if (ContainsInsensitive(messageOrCode, "agent run failed before producing a reply") ||
+            ContainsInsensitive(messageOrCode, "embedded agent failed before reply") ||
+            ContainsInsensitive(messageOrCode, "failed before reply"))
+        {
+            return "助手本次未能生成回复。可先点「新建会话」再试；若仍失败，请联系运维检查 Gateway 与算力出口（不一定是模型白名单问题）。";
         }
 
         if (ContainsCode(messageOrCode, UnauthorizedCode) ||
@@ -130,6 +153,32 @@ public static class ProductPlatformBilling
 
     public static string MapUserFacingErrorOrOriginal(string? messageOrCode, params string?[] extraCodes) =>
         TryMapUserFacingError(messageOrCode, extraCodes) ?? (messageOrCode ?? "request failed");
+
+    /// <summary>
+    /// True when the user-facing (or raw) error should offer a one-tap new-session
+    /// recovery control. Heavy sessions and LLM-exit 503s are the common cases.
+    /// </summary>
+    public static bool SuggestsNewSessionRecovery(string? messageOrCode, params string?[] extraCodes)
+    {
+        var mapped = TryMapUserFacingError(messageOrCode, extraCodes);
+        if (ContainsInsensitive(mapped, "新建会话") ||
+            ContainsInsensitive(mapped, "new session"))
+            return true;
+
+        if (ContainsInsensitive(messageOrCode, "新建会话") ||
+            ContainsInsensitive(messageOrCode, "new session") ||
+            ContainsInsensitive(messageOrCode, "503") ||
+            ContainsInsensitive(messageOrCode, "502") ||
+            ContainsInsensitive(messageOrCode, "chat completions unavailable") ||
+            ContainsInsensitive(messageOrCode, "failovererror") ||
+            ContainsInsensitive(messageOrCode, "fetch failed") ||
+            ContainsInsensitive(messageOrCode, "failed before reply") ||
+            (ContainsInsensitive(messageOrCode, "timeout") &&
+             ContainsInsensitive(messageOrCode, "llm")))
+            return true;
+
+        return false;
+    }
 
     private static bool CodesContain(string?[]? codes, string expected)
     {

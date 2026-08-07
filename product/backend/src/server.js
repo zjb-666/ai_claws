@@ -1,4 +1,5 @@
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { spawn } from "node:child_process";
 import { readFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -54,6 +55,65 @@ for (const p of [
     dotenv.config({ path: p });
     break;
   }
+}
+
+function mintLocalSetupCode(gatewayUrl, token) {
+  const candidates = [
+    process.env.OPENCLAW_CLI_PATH,
+    "E:\\openclaw-main\\openclaw.mjs",
+    join(ROOT, "../openclaw.mjs"),
+    join(ROOT, "../../openclaw.mjs"),
+    "E:\\ai_claw\\openclaw.mjs",
+  ].filter(Boolean);
+  // Prefer a built tree (dist/entry exists next to openclaw.mjs).
+  const cli = candidates.find((p) => {
+    if (!p.endsWith("openclaw.mjs") || !existsSync(p)) return false;
+    const distEntry = join(dirname(p), "dist", "entry.js");
+    const distEntryMjs = join(dirname(p), "dist", "entry.mjs");
+    return existsSync(distEntry) || existsSync(distEntryMjs);
+  });
+  if (!cli) {
+    return Promise.reject(new Error("openclaw.mjs with built dist/ not found for local setup-code mint"));
+  }
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      process.execPath,
+      [cli, "qr", "--url", gatewayUrl, "--token", token, "--setup-code-only"],
+      {
+        cwd: dirname(cli),
+        env: { ...process.env, OPENCLAW_GATEWAY_TOKEN: token },
+        windowsHide: true,
+      },
+    );
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += String(chunk);
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += String(chunk);
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      const raw = `${stdout}\n${stderr}`.trim();
+      const match = raw.match(/eyJ[A-Za-z0-9_-]+/);
+      if (!match) {
+        reject(new Error(`setup-code mint failed (exit ${code}): ${raw.slice(0, 300)}`));
+        return;
+      }
+      const setupCode = match[0];
+      try {
+        const json = Buffer.from(setupCode, "base64url").toString("utf8");
+        const payload = JSON.parse(json);
+        resolve({
+          gatewayUrl: payload.url || gatewayUrl,
+          setupCode,
+        });
+      } catch (err) {
+        reject(err);
+      }
+    });
+  });
 }
 
 const FEATURES_PATH = process.env.PRODUCT_FEATURES_PATH || join(ROOT, "config/features.json");
@@ -827,6 +887,68 @@ async function main() {
           .slice(0, 32)
       : [];
     try {
+      // Local Windows packaging/dev: force LAN gateway instead of platform's old server assignment.
+      const overrideGatewayUrl = String(process.env.DESKTOP_GATEWAY_OVERRIDE_URL || "").trim();
+      if (overrideGatewayUrl) {
+        const overrideToken = loadGatewayToken();
+        if (!overrideToken) {
+          return reply.code(503).send({
+            state: 503,
+            error: "desktop_bootstrap_unavailable",
+            message: "DESKTOP_GATEWAY_OVERRIDE_URL 已设置，但缺少 OPENCLAW_GATEWAY_TOKEN",
+          });
+        }
+        const assigned = new URL(overrideGatewayUrl);
+        assertAssignableGatewayUrl(assigned, "local override Gateway URL");
+        for (const pairedGatewayUrl of pairedGatewayUrls) {
+          let current;
+          try {
+            current = new URL(pairedGatewayUrl);
+          } catch {
+            continue;
+          }
+          const sameTransport =
+            current.protocol === assigned.protocol ||
+            (["http:", "ws:"].includes(current.protocol) &&
+              ["http:", "ws:"].includes(assigned.protocol)) ||
+            (["https:", "wss:"].includes(current.protocol) &&
+              ["https:", "wss:"].includes(assigned.protocol));
+          if (
+            sameTransport &&
+            current.host === assigned.host &&
+            current.pathname.replace(/\/$/, "") === assigned.pathname.replace(/\/$/, "")
+          ) {
+            return {
+              state: 200,
+              data: { gatewayUrl: overrideGatewayUrl },
+            };
+          }
+        }
+        // Prefer OpenClaw CLI QR mint (has operator.admin). Fallback to inline RPC.
+        let setup;
+        try {
+          setup = await mintLocalSetupCode(overrideGatewayUrl, overrideToken);
+        } catch (mintErr) {
+          req.log.warn({ err: mintErr }, "local setup-code CLI mint failed; trying gateway RPC");
+          setup = await gatewayRpc({
+            url: overrideGatewayUrl,
+            token: overrideToken,
+            method: "device.pair.setupCode",
+            params: {
+              includeQr: false,
+              publicUrl: overrideGatewayUrl,
+            },
+          });
+        }
+        return {
+          state: 200,
+          data: {
+            gatewayUrl: setup.gatewayUrl || overrideGatewayUrl,
+            setupCode: setup.setupCode,
+          },
+        };
+      }
+
       const assignment = await platformResolveDesktopGateway(platformAccessToken);
       const assignedGatewayUrl = String(assignment?.gatewayUrl || "").trim();
       const gatewayRpcUrl = String(assignment?.gatewayRpcUrl || assignedGatewayUrl).trim();

@@ -29,6 +29,25 @@ public sealed class SetupConfig
     [JsonIgnore]
     public bool UsesBundledDefaultConfig { get; set; }
 
+    /// <summary>
+    /// Gateway <c>wizard.start</c> flow. Default onboarding uses <c>setup</c>;
+    /// Hub channel setup uses <c>channels</c> (same as Control UI).
+    /// </summary>
+    public string WizardFlow { get; set; } = "setup";
+
+    /// <summary>
+    /// Optional channel id preselection for <see cref="WizardFlow"/> =
+    /// <c>channels</c> (e.g. <c>feishu</c>). Null lets the wizard list channels.
+    /// </summary>
+    public string? WizardChannel { get; set; }
+
+    /// <summary>
+    /// Invoked when a non-setup (e.g. channels) wizard finishes successfully.
+    /// Host windows use this to close; ignored during first-run SetupWindow flow.
+    /// </summary>
+    [JsonIgnore]
+    public Action? OnWizardCompleted { get; set; }
+
     // Nested config sections — everything is configurable
     public WslConfig Wsl { get; set; } = new();
     public GatewayConfig Gateway { get; set; } = new();

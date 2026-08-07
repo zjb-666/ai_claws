@@ -4,6 +4,7 @@ using Microsoft.UI.Reactor.Core.V1Protocol;
 using Microsoft.UI.Reactor.Hooks;
 using Microsoft.UI.Reactor.Input;
 using Microsoft.UI.Xaml;
+using Microsoft.UI.Xaml.Controls;
 using System.Runtime.CompilerServices;
 using WinUIAnnotatedScrollBar = Microsoft.UI.Xaml.Controls.AnnotatedScrollBar;
 using WinUIItemsView = Microsoft.UI.Xaml.Controls.ItemsView;
@@ -71,6 +72,14 @@ file sealed class ItemsViewVerticalScrollControllerHandler
     }
 }
 
+/// <summary>
+/// Pins chat to the latest row on session/history/send only, via ScrollView.ScrollTo.
+/// <para>
+/// Do not re-enter ItemsView measure via item bring-into-view or sticky bottom anchoring.
+/// Those feedback loops LayoutCycle while streaming content grows
+/// (openclaw-tray.log 2026-08-07 11:48 and 13:46).
+/// </para>
+/// </summary>
 file sealed class InitialTailPositioner : IDisposable
 {
     private readonly WinUIItemsView itemsView;
@@ -78,11 +87,9 @@ file sealed class InitialTailPositioner : IDisposable
     private int _tailIndex;
     private int _version;
     private bool _valid;
-    private bool _awaitingLayout;
     private WinUIScrollView? _awaitingScrollView;
-    private WinUIScrollView? _scrollView;
-    private bool _following;
     private bool _disposed;
+    private bool _pinQueued;
 
     public InitialTailPositioner(WinUIItemsView itemsView)
     {
@@ -97,127 +104,100 @@ file sealed class InitialTailPositioner : IDisposable
             return;
         _requestKey = requestKey;
         _version++;
-        DetachLayout();
+        CancelAwaitingScrollView();
         _valid = tailIndex >= 0;
         if (!_valid) return;
         _tailIndex = tailIndex;
-        SetFollowing(true);
-        if (itemsView.IsLoaded) AwaitLayout();
+        if (itemsView.IsLoaded) QueueOneShotPin();
     }
 
     public void UpdateTailIndex(int tailIndex)
     {
+        // Streaming growth: remember index only. Do NOT re-pin or set anchors —
+        // sticky follow during stream is what LayoutCycle'd the Hub.
         _tailIndex = tailIndex;
     }
 
     private void OnLoaded(object sender, RoutedEventArgs args)
     {
-        if (_valid) AwaitLayout();
+        if (_valid) QueueOneShotPin();
     }
 
-    private void AwaitLayout()
+    private void QueueOneShotPin()
     {
-        if (_disposed || !_valid || !itemsView.IsLoaded || _awaitingLayout) return;
+        if (_disposed || !_valid || !itemsView.IsLoaded || _pinQueued) return;
+
         if (itemsView.ScrollView is { IsLoaded: false } scrollView)
         {
             _awaitingScrollView = scrollView;
             scrollView.Loaded += OnScrollViewLoaded;
             return;
         }
-        _awaitingLayout = true;
-        itemsView.LayoutUpdated += OnLayoutUpdated;
+
+        _pinQueued = true;
+        var version = _version;
+        // Low priority: run after the current layout pass completes, never inside it.
+        itemsView.DispatcherQueue.TryEnqueue(
+            Microsoft.UI.Dispatching.DispatcherQueuePriority.Low,
+            () =>
+            {
+                _pinQueued = false;
+                if (_disposed || !_valid || !itemsView.IsLoaded || version != _version)
+                    return;
+                if (itemsView.ScrollView is not { IsLoaded: true } scrollView)
+                {
+                    if (itemsView.ScrollView is { } pending)
+                    {
+                        _awaitingScrollView = pending;
+                        pending.Loaded += OnScrollViewLoaded;
+                    }
+                    return;
+                }
+
+                TryScrollToBottom(scrollView);
+            });
+    }
+
+    private static void TryScrollToBottom(WinUIScrollView scrollView)
+    {
+        try
+        {
+            // Absolute offset — no item bring-into-view, no sticky bottom anchoring.
+            var maxOffset = Math.Max(0, scrollView.ExtentHeight - scrollView.ViewportHeight);
+            scrollView.ScrollTo(
+                scrollView.HorizontalOffset,
+                maxOffset,
+                new ScrollingScrollOptions(
+                    ScrollingAnimationMode.Disabled,
+                    ScrollingSnapPointsMode.Ignore));
+        }
+        catch (Exception ex)
+        {
+            OpenClawTray.Services.Logger.Debug(
+                $"[ReactorScroll] one-shot ScrollTo failed: {ex.Message}");
+        }
     }
 
     private void OnScrollViewLoaded(object sender, RoutedEventArgs args)
     {
         if (sender is WinUIScrollView scrollView) scrollView.Loaded -= OnScrollViewLoaded;
         _awaitingScrollView = null;
-        AwaitLayout();
-    }
-
-    private void OnLayoutUpdated(object? sender, object args)
-    {
-        DetachLayout();
-        if (itemsView.ScrollView is not { IsLoaded: true })
-        {
-            AwaitLayout();
-            return;
-        }
-        var version = _version;
-        var index = _tailIndex;
-        itemsView.DispatcherQueue.TryEnqueue(() =>
-        {
-            if (_disposed || !_valid || !itemsView.IsLoaded || version != _version
-                || itemsView.ScrollView is not { IsLoaded: true })
-            {
-                if (!_disposed && _valid) AwaitLayout();
-                return;
-            }
-            itemsView.StartBringItemIntoView(index, new BringIntoViewOptions
-            {
-                AnimationDesired = false,
-                VerticalAlignmentRatio = 1.0,
-            });
-            AttachScrollView();
-            ApplyFollowAnchor();
-        });
-    }
-
-    private void AttachScrollView()
-    {
-        if (ReferenceEquals(_scrollView, itemsView.ScrollView))
-            return;
-
-        if (_scrollView is not null)
-            _scrollView.ViewChanged -= OnViewChanged;
-        _scrollView = itemsView.ScrollView;
-        if (_scrollView is not null)
-            _scrollView.ViewChanged += OnViewChanged;
-    }
-
-    private void OnViewChanged(WinUIScrollView sender, object args)
-    {
-        if (_tailIndex < 0
-            || !itemsView.TryGetItemIndex(0.5, 1.0, out var bottomIndex))
-        {
-            return;
-        }
-
-        SetFollowing(bottomIndex >= _tailIndex);
-    }
-
-    private void SetFollowing(bool following)
-    {
-        if (_following == following)
-            return;
-
-        _following = following;
-        ApplyFollowAnchor();
-    }
-
-    private void ApplyFollowAnchor()
-    {
-        if (itemsView.ScrollView is { IsLoaded: true } scrollView)
-            scrollView.VerticalAnchorRatio = _following ? 1.0 : double.NaN;
+        QueueOneShotPin();
     }
 
     private void OnUnloaded(object sender, RoutedEventArgs args)
     {
         _version++;
-        DetachLayout();
+        CancelAwaitingScrollView();
+        _pinQueued = false;
     }
 
-    private void DetachLayout()
+    private void CancelAwaitingScrollView()
     {
         if (_awaitingScrollView is { } scrollView)
         {
             scrollView.Loaded -= OnScrollViewLoaded;
             _awaitingScrollView = null;
-        }
-        if (_awaitingLayout)
-        {
-            itemsView.LayoutUpdated -= OnLayoutUpdated;
-            _awaitingLayout = false;
         }
     }
 
@@ -226,10 +206,8 @@ file sealed class InitialTailPositioner : IDisposable
         if (_disposed) return;
         _disposed = true;
         _version++;
-        DetachLayout();
-        if (_scrollView is not null)
-            _scrollView.ViewChanged -= OnViewChanged;
-        _scrollView = null;
+        CancelAwaitingScrollView();
+        _pinQueued = false;
         itemsView.Loaded -= OnLoaded;
         itemsView.Unloaded -= OnUnloaded;
     }

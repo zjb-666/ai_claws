@@ -324,6 +324,12 @@ public sealed partial class ChannelsPage : Page
             new OpenClawTray.AppLogger(),
             nameof(OnRefreshAll));
 
+    private void OnSetupWizard(object sender, RoutedEventArgs e) =>
+        CurrentApp.StartChannelSetupWizard(channelId: null);
+
+    private void OnChannelSetupWizard(string channelId) =>
+        CurrentApp.StartChannelSetupWizard(channelId);
+
     private async Task RefreshAsync(bool probe = true)
     {
         var client = CurrentApp.GatewayClient;
@@ -1049,6 +1055,18 @@ public sealed partial class ChannelsPage : Page
             };
             stack.Children.Add(helpLink);
         }
+
+        // Official gateway channel wizard (Control UI parity): one click opens
+        // wizard.start { flow: "channels", channel } instead of CLI/tool thrash.
+        var channelId = record.Id;
+        var wizardButton = new Button
+        {
+            Content = LocalizationHelper.GetString("ChannelsPage_OpenSetupWizard"),
+            Margin = new Thickness(0, 8, 0, 0),
+            HorizontalAlignment = HorizontalAlignment.Left,
+        };
+        wizardButton.Click += (_, _) => OnChannelSetupWizard(channelId);
+        stack.Children.Add(wizardButton);
 
         card.Child = stack;
         return card;

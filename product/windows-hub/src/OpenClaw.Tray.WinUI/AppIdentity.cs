@@ -1,8 +1,8 @@
 namespace OpenClawTray;
 
 /// <summary>
-/// Compile-time app identity constants that vary between Dev and Release builds,
-/// enabling side-by-side installation of both variants (similar to WinUI Gallery).
+/// Compile-time app identity constants that vary between Dev, Test, and Release
+/// builds, enabling side-by-side installation of each variant (similar to WinUI Gallery).
 /// </summary>
 internal static class AppIdentity
 {
@@ -45,6 +45,51 @@ internal static class AppIdentity
 
     /// <summary>Whether this is a development build.</summary>
     public static bool IsDev => true;
+
+    /// <summary>Whether this is a test-environment build.</summary>
+    public static bool IsTest => false;
+#elif TEST_BUILD
+    /// <summary>Human-visible app name shown in tray tooltips, window titles, and notifications.</summary>
+    public const string DisplayName = "聚元灵创 (测试环境)";
+
+    /// <summary>Short name used in tray tooltip prefix.</summary>
+    public const string TrayName = "聚元灵创 (测试环境)";
+
+    /// <summary>MSIX package identity name (must differ from release for side-by-side).</summary>
+    public const string PackageIdentityName = "Juyuan.Lingchuang.Test";
+
+    /// <summary>Win32 AppUserModelID used for notifications and shell grouping.</summary>
+    public const string AppUserModelId = PackageIdentityName;
+
+    /// <summary>Windows Registry auto-start value name (must differ so both can auto-start).</summary>
+    public const string AutoStartRegistryName = "JuyuanLingchuang-Test";
+
+    /// <summary>Windows scheduled task name (must differ so both can auto-start).</summary>
+    public const string StartupTaskName = "聚元灵创 (测试环境)";
+
+    /// <summary>Leaf directory for local and roaming app-owned data.</summary>
+    public const string DataDirectoryName = "JuyuanLingchuang-Test";
+
+    /// <summary>Single-instance mutex base name.</summary>
+    public const string MutexBaseName = "JuyuanLingchuang-Test";
+
+    /// <summary>Protocol scheme for deep links.</summary>
+    public const string ProtocolScheme = "juyuanlingchuang-test";
+
+    /// <summary>App-owned WSL distro used by embedded setup.</summary>
+    public const string SetupDistroName = "JuyuanLingchuangGateway-Test";
+
+    /// <summary>Loopback gateway port used by embedded setup.</summary>
+    public const int SetupGatewayPort = 18791;
+
+    /// <summary>Default gateway URL for this app variant.</summary>
+    public const string SetupGatewayUrl = "ws://localhost:18791";
+
+    /// <summary>Whether this is a development build.</summary>
+    public static bool IsDev => false;
+
+    /// <summary>Whether this is a test-environment build.</summary>
+    public static bool IsTest => true;
 #else
     /// <summary>Human-visible app name shown in tray tooltips, window titles, and notifications.</summary>
     public const string DisplayName = "聚元灵创";
@@ -84,6 +129,9 @@ internal static class AppIdentity
 
     /// <summary>Whether this is a development build.</summary>
     public static bool IsDev => false;
+
+    /// <summary>Whether this is a test-environment build.</summary>
+    public static bool IsTest => false;
 #endif
 
     public static string ResolveLocalDataDirectory()
@@ -117,6 +165,8 @@ internal static class AppIdentity
                 Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
                 DataDirectoryName);
 
-    public static string DecorateWindowTitle(string title)
-        => IsDev ? $"{title} (Dev)" : title;
+    public static string DecorateWindowTitle(string title) =>
+        IsDev ? $"{title} (Dev)" :
+        IsTest ? $"{title} (测试环境)" :
+        title;
 }

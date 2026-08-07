@@ -56,9 +56,17 @@ internal static class ChatLifecycleSelectionPolicy
     public static bool ShouldFallback(
         string staleSelectedId,
         string? pendingSelectedId,
-        string fallbackThreadId) =>
-        !string.Equals(pendingSelectedId, staleSelectedId, StringComparison.Ordinal) &&
-        !string.Equals(staleSelectedId, fallbackThreadId, StringComparison.Ordinal);
+        string fallbackThreadId)
+    {
+        // Pending-new compose keys are client-local and never appear in
+        // sessions.list. Do not snap back to the previous real session.
+        if (ChatPendingNewSession.IsPendingKey(staleSelectedId) ||
+            ChatPendingNewSession.IsPendingKey(pendingSelectedId))
+            return false;
+
+        return !string.Equals(pendingSelectedId, staleSelectedId, StringComparison.Ordinal) &&
+               !string.Equals(staleSelectedId, fallbackThreadId, StringComparison.Ordinal);
+    }
 }
 
 internal static class ChatLifecycleCommandExecutionPolicy

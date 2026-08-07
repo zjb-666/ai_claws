@@ -12,6 +12,7 @@
     .EXAMPLE
     .\scripts\build-inno-local.ps1 -Arch x64 -ProductApiBaseUrl https://app.example.com -Fast
     .\scripts\build-inno-local.ps1 -Arch x64 -ProductApiBaseUrl http://192.168.120.12:8787 -Dev -Fast
+    .\scripts\build-inno-local.ps1 -Arch x64 -ProductApiBaseUrl https://juyuanagi.com:6057 -Test -Fast
     .\scripts\build-inno-local.ps1 -Arch All -ProductApiBaseUrl https://app.example.com
     .\scripts\build-inno-local.ps1 -Arch x64 -NoPublish -Fast
 #>
@@ -33,6 +34,8 @@ param(
     [switch]$Fast,
 
     [switch]$Dev,
+
+    [switch]$Test,
 
     [switch]$InstallInno
 )
@@ -135,12 +138,25 @@ function Publish-ArchitecturePayload {
     Remove-Item -LiteralPath $publishDir -Recurse -Force -ErrorAction SilentlyContinue
     New-Item -ItemType Directory -Path $publishDir | Out-Null
 
+    if ($Dev -and $Test) {
+        throw "Pass only one of -Dev or -Test."
+    }
+
     $configuredProductApiUrl = $ProductApiBaseUrl
     if (-not $configuredProductApiUrl) {
         if ($Dev) {
             throw "Product API URL is empty. Pass -ProductApiBaseUrl http://192.168.x.x:8787 for Dev LAN builds."
         }
+        if ($Test) {
+            throw "Product API URL is empty. Pass -ProductApiBaseUrl https://your-test-product-host for Test builds."
+        }
         throw "Product API URL is empty. Pass -ProductApiBaseUrl https://your-public-product-host before publishing."
+    }
+
+    # Hub appends /api/desktop/... itself. Accept either https://host or https://host/api.
+    $configuredProductApiUrl = $configuredProductApiUrl.Trim().TrimEnd('/')
+    if ($configuredProductApiUrl -match '(?i)/api$') {
+        $configuredProductApiUrl = $configuredProductApiUrl.Substring(0, $configuredProductApiUrl.Length - 4).TrimEnd('/')
     }
 
     $configuredUri = [Uri]$configuredProductApiUrl
@@ -155,7 +171,7 @@ function Publish-ArchitecturePayload {
         }
     }
     elseif ($configuredUri.Scheme -ne "https" -or $configuredUri.IsLoopback -or (Test-PrivateOrLocalHost $configuredUri.Host)) {
-        throw "Release ProductApiBaseUrl must be a public HTTPS URL."
+        throw "Release/Test ProductApiBaseUrl must be a public HTTPS URL."
     }
 
     $trayPublishArgs = @(
@@ -166,6 +182,7 @@ function Publish-ArchitecturePayload {
         "-o", $publishDir,
         "-v:minimal",
         "-p:DevBuild=$($Dev.IsPresent.ToString().ToLowerInvariant())",
+        "-p:TestBuild=$($Test.IsPresent.ToString().ToLowerInvariant())",
         "-p:ProductApiBaseUrl=$($configuredUri.AbsoluteUri.TrimEnd('/'))"
     )
     if ($PublishVersion) {
@@ -189,7 +206,7 @@ function Assert-PayloadReady {
     }
 
     $identityMarker = Join-Path $publishDir "app-identity.txt"
-    $expectedIdentity = if ($Dev) { "dev" } else { "release" }
+    $expectedIdentity = if ($Dev) { "dev" } elseif ($Test) { "test" } else { "release" }
     if (-not (Test-Path -LiteralPath $identityMarker)) {
         throw "Missing payload identity marker at $identityMarker. Rerun without -NoPublish."
     }
@@ -230,6 +247,9 @@ function Invoke-InnoCompiler {
     if ($Dev) {
         $args += "/DDevBuild=1"
     }
+    if ($Test) {
+        $args += "/DTestBuild=1"
+    }
 
     $args += ".\installer.iss"
 
@@ -256,7 +276,7 @@ $architectures = if ($Arch -eq "All") { @("x64", "arm64") } else { @($Arch) }
 Write-Step "Using ISCC: $iscc"
 Write-Host "Version: $Version"
 Write-Host "Configuration: $Configuration"
-Write-Host "Identity: $(if ($Dev) { 'dev' } else { 'release' })"
+Write-Host "Identity: $(if ($Dev) { 'dev' } elseif ($Test) { 'test' } else { 'release' })"
 Write-Host "Fast compression: $($Fast.IsPresent)"
 Write-Host "No publish: $($NoPublish.IsPresent)"
 

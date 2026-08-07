@@ -32,7 +32,12 @@ public sealed record OpenClawReactorChatRootProps(
     Action<bool>? OnSpeakerMuteChanged = null,
     Func<string, string?, Task<bool>>? ConfirmResetAsync = null,
     bool InitialMuted = false,
-    bool IsCompact = false);
+    bool IsCompact = false,
+    /// <summary>
+    /// When chat text matches a channel-setup intent, invoke with the channel id
+    /// (or null to browse) and return true to suppress the agent send.
+    /// </summary>
+    Func<string?, Task<bool>>? OnChannelSetupIntent = null);
 
 /// <summary>
 /// Production Reactor root for the native chat surface. It owns the provider
@@ -45,6 +50,7 @@ public sealed class OpenClawReactorChatRoot : Component<OpenClawReactorChatRootP
     private static event EventHandler? ToolCallsVisibilityChanged;
 
     private string? _pendingSelectedThreadId;
+    private string? _pendingNewParentSessionKey;
 
     public static void SetToolCallsVisible(bool visible)
     {
@@ -111,21 +117,80 @@ public sealed class OpenClawReactorChatRoot : Component<OpenClawReactorChatRootP
         UseEffect((Func<Action>)(() =>
         {
             var provider = props.Provider;
-            EventHandler<ChatDataChangedEventArgs> onChanged = (_, args) =>
+            var dispatcher = Microsoft.UI.Dispatching.DispatcherQueue.GetForCurrentThread();
+            Microsoft.UI.Dispatching.DispatcherQueueTimer? coalesceTimer = null;
+            ChatDataSnapshot? pendingSnapshot = null;
+
+            void ApplySnapshot(ChatDataSnapshot snap)
             {
-                setSnapshot(args.Snapshot);
-                if (args.Snapshot.ComposeTarget.SessionKey is { } composeKey
-                    && args.Snapshot.Timelines.TryGetValue(composeKey, out var timeline)
+                setSnapshot(snap);
+                if (snap.ComposeTarget.SessionKey is { } composeKey
+                    && snap.Timelines.TryGetValue(composeKey, out var timeline)
                     && timeline.Entries.Any(entry => entry.Kind == ChatTimelineItemKind.User))
                 {
                     setFirstSendInFlight(false);
                 }
 
-                if (selectedIdRef.Current is null && args.Snapshot.DefaultThreadId is { } defaultThreadId)
+                if (selectedIdRef.Current is null && snap.DefaultThreadId is { } defaultThreadId)
                 {
                     selectedIdRef.Current = defaultThreadId;
                     setSelectedId(defaultThreadId);
                 }
+            }
+
+            static bool SnapshotIsStreaming(ChatDataSnapshot snap)
+            {
+                foreach (var timeline in snap.Timelines.Values)
+                {
+                    if (timeline.TurnActive)
+                        return true;
+                    for (var i = 0; i < timeline.Entries.Count; i++)
+                    {
+                        if (timeline.Entries[i].IsStreaming)
+                            return true;
+                    }
+                }
+
+                return false;
+            }
+
+            void FlushPending()
+            {
+                if (pendingSnapshot is not { } snap)
+                    return;
+                pendingSnapshot = null;
+                ApplySnapshot(snap);
+            }
+
+            void OnCoalesceTick(Microsoft.UI.Dispatching.DispatcherQueueTimer sender, object args)
+            {
+                try { sender.Stop(); } catch { /* ignore */ }
+                FlushPending();
+            }
+
+            if (dispatcher is not null)
+            {
+                coalesceTimer = dispatcher.CreateTimer();
+                coalesceTimer.IsRepeating = false;
+                coalesceTimer.Interval = TimeSpan.FromMilliseconds(120);
+                coalesceTimer.Tick += OnCoalesceTick;
+            }
+
+            EventHandler<ChatDataChangedEventArgs> onChanged = (_, args) =>
+            {
+                // Idle / turn-final: paint immediately. Streaming deltas: coalesce so
+                // ItemsView is not remounted on every token (LayoutCycle under measure).
+                if (!SnapshotIsStreaming(args.Snapshot) || coalesceTimer is null)
+                {
+                    pendingSnapshot = null;
+                    try { coalesceTimer?.Stop(); } catch { /* disposed */ }
+                    ApplySnapshot(args.Snapshot);
+                    return;
+                }
+
+                pendingSnapshot = args.Snapshot;
+                if (!coalesceTimer.IsRunning)
+                    coalesceTimer.Start();
             };
 
             provider.Changed += onChanged;
@@ -138,7 +203,16 @@ public sealed class OpenClawReactorChatRoot : Component<OpenClawReactorChatRootP
                     selectedIdRef.Current = next;
                     setSelectedId(next);
                 });
-            return () => provider.Changed -= onChanged;
+            return () =>
+            {
+                provider.Changed -= onChanged;
+                if (coalesceTimer is not null)
+                {
+                    coalesceTimer.Tick -= OnCoalesceTick;
+                    try { coalesceTimer.Stop(); } catch { /* ignore */ }
+                }
+                FlushPending();
+            };
         }), props.Provider);
 
         if (snapshot is null)
@@ -161,8 +235,12 @@ public sealed class OpenClawReactorChatRoot : Component<OpenClawReactorChatRootP
                 string.Equals(thread.Id, fallbackId, StringComparison.Ordinal));
         }
 
-        var effectiveThread = selectedMaterializedThread ?? CreateComposeOnlyThread(props.Provider, snapshot);
-        if (effectiveThread is { } selected && string.Equals(_pendingSelectedThreadId, selected.Id, StringComparison.Ordinal))
+        var effectiveThread = selectedMaterializedThread ?? CreateComposeOnlyThread(props.Provider, snapshot, selectedId);
+        // Only clear the pending selection once the key has materialized as a
+        // real gateway session. Local pending-new keys must stay sticky until
+        // the first send commits sessions.create.
+        if (selectedMaterializedThread is { } materialized
+            && string.Equals(_pendingSelectedThreadId, materialized.Id, StringComparison.Ordinal))
             _pendingSelectedThreadId = null;
 
         var connectionState = ToConnectionState(snapshot.ConnectionStatus);
@@ -174,10 +252,13 @@ public sealed class OpenClawReactorChatRoot : Component<OpenClawReactorChatRootP
             RunFireAndForget(ct => nativeProvider.LoadHistoryAsync(selectedMaterializedThread.Id, force: false, ct));
         }
 
+        var isPendingNew = ChatPendingNewSession.IsPendingKey(effectiveThread?.Id);
         var timeline = effectiveThread is not null
             && snapshot.Timelines.TryGetValue(effectiveThread.Id, out var currentTimeline)
             ? currentTimeline
             : ChatTimelineState.Initial();
+        if (isPendingNew && !timeline.HistoryLoaded)
+            timeline = timeline with { HistoryLoaded = true };
         var timelineGeneration = effectiveThread is not null
             && snapshot.TimelineGenerations?.TryGetValue(effectiveThread.Id, out var generation) == true
                 ? generation
@@ -215,10 +296,11 @@ public sealed class OpenClawReactorChatRoot : Component<OpenClawReactorChatRootP
         var welcomeEligible = isEmptyConversation
             && isGatewayConnected
             && (
-                (isComposeOnly && !hasRealThreads)
+                isPendingNew
+                || (isComposeOnly && !hasRealThreads)
                 || (!isComposeOnly && timeline.HistoryLoaded));
         var welcomeEligibilityKey = welcomeEligible
-            ? $"{effectiveThread?.Id}|{isComposeOnly}|{timeline.HistoryLoaded}|{hasRealThreads}"
+            ? $"{effectiveThread?.Id}|{isComposeOnly}|{timeline.HistoryLoaded}|{hasRealThreads}|{isPendingNew}"
             : null;
         var welcomeEligibilityKeyRef = UseRef<string?>(welcomeEligibilityKey);
         welcomeEligibilityKeyRef.Current = welcomeEligibilityKey;
@@ -250,10 +332,12 @@ public sealed class OpenClawReactorChatRoot : Component<OpenClawReactorChatRootP
             welcomeEligibilityKey);
 
         var emptyConversationIsAuthoritative = welcomeEligibilityKey is not null
-            && string.Equals(
-                settledWelcomeKey,
-                welcomeEligibilityKey,
-                StringComparison.Ordinal);
+            && (
+                isPendingNew
+                || string.Equals(
+                    settledWelcomeKey,
+                    welcomeEligibilityKey,
+                    StringComparison.Ordinal));
         var mode = effectiveThread is null
                    || (isEmptyConversation && !emptyConversationIsAuthoritative)
             ? ReactorChatTimelineMode.Loading
@@ -282,15 +366,34 @@ public sealed class OpenClawReactorChatRoot : Component<OpenClawReactorChatRootP
             scrollToBottomToken,
             effectiveThread is { } permissionThread
                 ? (requestId, action) => OnPermission(permissionThread.Id, requestId, action)
-                : null);
+                : null,
+            StartNewSession);
 
         void SelectThread(string threadId)
         {
             _pendingSelectedThreadId = threadId;
             selectedIdRef.Current = threadId;
             setSelectedId(threadId);
-            if (props.Provider is OpenClawChatDataProvider native)
+            if (props.Provider is OpenClawChatDataProvider native
+                && !ChatPendingNewSession.IsPendingKey(threadId))
                 native.RememberSelectedThread(threadId);
+        }
+
+        void StartNewSession()
+        {
+            if (!isGatewayConnected)
+                return;
+
+            // ClawWork-style pending-new: switch to a clean empty page now.
+            // sessions.create waits until the first user message.
+            var parentKey = selectedMaterializedThread?.Id
+                ?? (ChatPendingNewSession.IsPendingKey(effectiveThread?.Id)
+                    ? _pendingNewParentSessionKey
+                    : effectiveThread?.Id)
+                ?? snapshot.ComposeTarget.SessionKey
+                ?? snapshot.DefaultThreadId;
+            _pendingNewParentSessionKey = parentKey;
+            SelectThread(ChatPendingNewSession.AllocateKey());
         }
 
         Action<string>? onSuggestionPicked = null;
@@ -370,7 +473,8 @@ public sealed class OpenClawReactorChatRoot : Component<OpenClawReactorChatRootP
                 snapshot.AvailableCommands,
                 snapshot.CommandsSupported,
                 () => RunFireAndForget(ct => props.Provider.EnsureCommandCatalogAsync(ct)),
-                props.IsCompact));
+                props.IsCompact,
+                StartNewSession));
 
         return Grid(
             [GridSize.Star()],
@@ -390,21 +494,25 @@ public sealed class OpenClawReactorChatRoot : Component<OpenClawReactorChatRootP
 
     private ChatThread? CreateComposeOnlyThread(
         IChatDataProvider provider,
-        ChatDataSnapshot snapshot)
+        ChatDataSnapshot snapshot,
+        string? selectedId)
     {
-        var composeKey = _pendingSelectedThreadId
+        var composeKey =
+            (ChatPendingNewSession.IsPendingKey(selectedId) ? selectedId : null)
+            ?? _pendingSelectedThreadId
             ?? (snapshot.ComposeTarget.IsReady ? snapshot.ComposeTarget.SessionKey : null);
         if (composeKey is null)
             return null;
 
         var cached = (provider as OpenClawChatDataProvider)?.CachedLastChatState;
+        var isPendingNew = ChatPendingNewSession.IsPendingKey(composeKey);
         return new ChatThread
         {
             Id = composeKey,
             AgentId = snapshot.ComposeTarget.AgentId,
-            Title = _pendingSelectedThreadId is null
-                ? cached?.ThreadTitle ?? "聚元灵创"
-                : LocalizationHelper.GetString("Chat_PendingNewSessionTitle"),
+            Title = isPendingNew || _pendingSelectedThreadId is not null
+                ? LocalizationHelper.GetString("Chat_PendingNewSessionTitle")
+                : cached?.ThreadTitle ?? "聚元灵创",
             Model = cached?.Model,
             ModelProvider = cached?.ModelProvider,
             Status = ChatThreadStatus.Running,
@@ -437,6 +545,16 @@ public sealed class OpenClawReactorChatRoot : Component<OpenClawReactorChatRootP
         if (provider is OpenClawChatDataProvider native
             && ChatLifecycleCommandParser.TryParse(message, attachments.Count > 0, out var command))
         {
+            if (command == ChatLifecycleCommandKind.New)
+            {
+                // Product New Session is pending-new, not an immediate
+                // sessions.create against the current heavy transcript.
+                if (!ChatPendingNewSession.IsPendingKey(threadId))
+                    _pendingNewParentSessionKey = threadId;
+                onLifecycleSessionCreated(ChatPendingNewSession.AllocateKey());
+                return true;
+            }
+
             if (ChatLifecycleCommandExecutionPolicy.ShouldQueue(command))
                 return await native.EnqueueCompactCommandAsync(threadId);
 
@@ -453,9 +571,42 @@ public sealed class OpenClawReactorChatRoot : Component<OpenClawReactorChatRootP
             return result.Succeeded;
         }
 
+        if (attachments.Count == 0
+            && ChannelSetupIntent.TryParse(message, out var channelId)
+            && Props.OnChannelSetupIntent is not null)
+        {
+            return await Props.OnChannelSetupIntent(channelId);
+        }
+
         try
         {
-            await provider.SendMessageAsync(threadId, message, CancellationToken.None, attachments);
+            var sendThreadId = threadId;
+            if (ChatPendingNewSession.IsPendingKey(threadId))
+            {
+                if (provider is not OpenClawChatDataProvider pendingNative)
+                    return false;
+
+                var parentKey = _pendingNewParentSessionKey;
+                if (string.IsNullOrWhiteSpace(parentKey)
+                    && provider is OpenClawChatDataProvider parentProvider)
+                {
+                    parentKey = parentProvider.CachedLastChatState?.DefaultThreadId;
+                }
+                if (string.IsNullOrWhiteSpace(parentKey))
+                    return false;
+
+                var created = await pendingNative.ExecuteLifecycleCommandAsync(
+                    parentKey,
+                    ChatLifecycleCommandKind.New);
+                if (!created.Succeeded || created.NewSessionKey is not { } newSessionKey)
+                    return false;
+
+                _pendingNewParentSessionKey = null;
+                onLifecycleSessionCreated(newSessionKey);
+                sendThreadId = newSessionKey;
+            }
+
+            await provider.SendMessageAsync(sendThreadId, message, CancellationToken.None, attachments);
             return true;
         }
         catch (Exception ex)
@@ -577,7 +728,8 @@ public sealed record ReactorChatComposerProps(
     IReadOnlyList<GatewayCommand>? AvailableCommands,
     bool CommandsSupported,
     Action? OnCommandsRequested,
-    bool IsCompact);
+    bool IsCompact,
+    Action? OnNewSession = null);
 
 public sealed class ReactorChatComposer : Component<ReactorChatComposerProps>
 {
@@ -585,6 +737,11 @@ public sealed class ReactorChatComposer : Component<ReactorChatComposerProps>
     private static readonly ConditionalWeakTable<FrameworkElement, ThemeCallbackState> ThemeCallbacks = new();
     private static readonly global::Windows.UI.ViewManagement.AccessibilitySettings? AccessibilitySettings =
         CreateAccessibilitySettings();
+    // Unpackaged WinUI often cannot subscribe to HighContrastChanged at all.
+    // Remember process-wide so remounted composer elements do not retry/log on
+    // every FunctionalUI reconcile (that remount storm shows up next to
+    // LayoutCycleException in openclaw-tray.log).
+    private static bool s_highContrastEventUnavailable;
 
     private sealed class ThemeCallbackState(Action apply)
     {
@@ -660,6 +817,7 @@ public sealed class ReactorChatComposer : Component<ReactorChatComposerProps>
         ThemeCallbackState state)
     {
         if (AccessibilitySettings is null
+            || s_highContrastEventUnavailable
             || state.HighContrastChanged is not null
             || state.HighContrastEventUnavailable)
             return;
@@ -684,9 +842,10 @@ public sealed class ReactorChatComposer : Component<ReactorChatComposerProps>
             // Unpackaged WinUI often throws InvalidCastException ("interface not
             // supported") for HighContrastChanged — catching only COMException
             // left that as an unhandled crash that blanked Hub + chat.
+            s_highContrastEventUnavailable = true;
             state.HighContrastEventUnavailable = true;
             OpenClawTray.Services.Logger.Warn(
-                $"[ReactorChatComposer] High Contrast change notifications are unavailable: {ex.Message}");
+                $"[ReactorChatComposer] High Contrast change notifications are unavailable (disabled for process): {ex.Message}");
         }
     }
 
@@ -1330,11 +1489,14 @@ public sealed class ReactorChatComposer : Component<ReactorChatComposerProps>
             return static () => { };
         }), popupStateKey);
 
+        var sessionPickerEnabled = props.ConnectionState == "connected"
+            && !props.MessageOptionsDisabled
+            && (props.AvailableChannels.Count > 1 || props.OnNewSession is not null);
         var sessionPicker = MenuFlyout(
             PickerButton(
                 props.CurrentThread.Title,
                 $"{Localized("Chat_Composer_Accessibility_Session", "Session")}: {props.CurrentThread.Title}",
-                !props.MessageOptionsDisabled && props.AvailableChannels.Count > 1,
+                sessionPickerEnabled,
                 props.IsCompact ? 56 : 160),
             props.AvailableChannels
                 .Select(thread => RadioMenuItem(
@@ -1343,6 +1505,16 @@ public sealed class ReactorChatComposer : Component<ReactorChatComposerProps>
                     string.Equals(thread.Id, props.CurrentThread.Id, StringComparison.Ordinal),
                     () => props.OnChannelChanged(thread.Id)))
                 .ToArray());
+
+        var newSessionLabel = Localized("Chat_Composer_Tooltip_NewSession", "New session");
+        var newSessionButton = props.OnNewSession is null
+            ? Empty()
+            : IconButton(
+                "\uE710",
+                newSessionLabel,
+                props.OnNewSession,
+                props.ConnectionState == "connected")
+                .AutomationId("ChatNewSessionButton");
 
         var modelPickerLabel = modelIndex == 0
             ? Localized("Chat_Composer_Reasoning_Default", "Default")
@@ -1441,7 +1613,7 @@ public sealed class ReactorChatComposer : Component<ReactorChatComposerProps>
                     ToolTipService.SetToolTip(button, actionLabel);
                 });
 
-        var leftToolbar = HStack(8, attachButton, sessionPicker, modelPicker, reasoningPicker)
+        var leftToolbar = HStack(8, attachButton, newSessionButton, sessionPicker, modelPicker, reasoningPicker)
             .HAlign(HorizontalAlignment.Left)
             .VAlign(VerticalAlignment.Center);
         var rightToolbar = HStack(8, voiceButton, speakerButton, settingsButton, primaryAction)

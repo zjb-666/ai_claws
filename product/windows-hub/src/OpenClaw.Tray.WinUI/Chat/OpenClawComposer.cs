@@ -83,7 +83,8 @@ public record OpenClawComposerProps(
     IReadOnlyList<GatewayCommand>? AvailableCommands = null,
     bool CommandsSupported = true,
     Action? OnCommandsRequested = null,
-    double? AvailableHeight = null);
+    double? AvailableHeight = null,
+    Action? OnNewSession = null);
 
 public sealed class OpenClawComposer : Component<OpenClawComposerProps>
 {
@@ -1367,6 +1368,22 @@ public sealed class OpenClawComposer : Component<OpenClawComposerProps>
         {
             Props.OnAttachClick?.Invoke();
         });
+        Element newSessionBtn = Props.OnNewSession is null
+            ? Empty()
+            : IconButton(
+                "\uE710",
+                LocalizationHelper.GetString("Chat_Composer_Tooltip_NewSession"),
+                () => Props.OnNewSession())
+                .Set(fe =>
+                {
+                    if (fe is Button button)
+                    {
+                        button.IsEnabled = isConnected;
+                        Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(
+                            button,
+                            "ChatNewSessionButton");
+                    }
+                });
 
         // Voice recording: three-button model
         // - Not recording: mic button starts recording
@@ -1556,7 +1573,7 @@ public sealed class OpenClawComposer : Component<OpenClawComposerProps>
         // single primary-action slot that is the accent Send when idle and the
         // accent Stop while a turn is active. Mirrors the design-system
         // ChatComposer toolbar.
-        var leftCluster = (FlexRow(attachBtn, channelPicker, modelPicker, reasoningPicker)
+        var leftCluster = (FlexRow(attachBtn, newSessionBtn, channelPicker, modelPicker, reasoningPicker)
                 with { ColumnGap = 4 })
             .HAlign(HorizontalAlignment.Left)
             .VAlign(VerticalAlignment.Center);

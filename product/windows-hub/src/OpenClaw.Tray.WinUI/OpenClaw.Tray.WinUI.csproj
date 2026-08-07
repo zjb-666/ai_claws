@@ -29,7 +29,15 @@
     <FileDescription>聚元灵创 Windows 智能助手 (Dev)</FileDescription>
     <Product>聚元灵创 (Dev)</Product>
   </PropertyGroup>
-  <PropertyGroup Condition="'$(DevBuild)' != 'true'">
+  <!-- Test-environment identity: side-by-side with Dev/Release, points at staging Product API. -->
+  <PropertyGroup Condition="'$(TestBuild)' == 'true'">
+    <DefineConstants>$(DefineConstants);TEST_BUILD</DefineConstants>
+    <AppIdentityMarker>test</AppIdentityMarker>
+    <AssemblyTitle>聚元灵创 (测试环境)</AssemblyTitle>
+    <FileDescription>聚元灵创 Windows 智能助手 (测试环境)</FileDescription>
+    <Product>聚元灵创 (测试环境)</Product>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(DevBuild)' != 'true' and '$(TestBuild)' != 'true'">
     <AppIdentityMarker>release</AppIdentityMarker>
   </PropertyGroup>
 

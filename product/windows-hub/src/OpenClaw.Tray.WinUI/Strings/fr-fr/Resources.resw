@@ -2853,6 +2853,12 @@ Utilisez l'une de ces options :
   <data name="Chat_PendingNewSessionTitle" xml:space="preserve">
     <value>Nouvelle session</value>
   </data>
+  <data name="Chat_Composer_Tooltip_NewSession" xml:space="preserve">
+    <value>Nouvelle session</value>
+  </data>
+  <data name="Chat_Error_NewSessionAction" xml:space="preserve">
+    <value>Nouvelle session</value>
+  </data>
   <data name="Chat_Status_Running" xml:space="preserve">
     <value>En cours</value>
   </data>
@@ -3669,6 +3675,12 @@ Les commandes sont bloquées tant que le sandboxing est indisponible, car le blo
   </data>
   <data name="ChannelsPage_Refresh.Text" xml:space="preserve">
     <value>Rafraîchir</value>
+  </data>
+  <data name="ChannelsPage_SetupWizard.Text" xml:space="preserve">
+    <value>Assistant de configuration</value>
+  </data>
+  <data name="ChannelsPage_OpenSetupWizard" xml:space="preserve">
+    <value>Ouvrir l'assistant officiel</value>
   </data>
   <data name="ChannelsPage_ConfiguredHeader.Text" xml:space="preserve">
     <value>CONFIGURÉ</value>

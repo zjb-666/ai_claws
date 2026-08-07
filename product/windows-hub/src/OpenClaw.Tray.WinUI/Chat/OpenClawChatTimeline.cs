@@ -55,7 +55,8 @@ public record OpenClawChatTimelineProps(
     Func<string, Task>? OnReadAloud = null,
     Action? OnStopSpeaking = null,
     int ScrollToBottomToken = 0,
-    Action<string, string>? OnPermissionResponse = null);
+    Action<string, string>? OnPermissionResponse = null,
+    Action? OnNewSession = null);
 
 /// <summary>
 /// OpenClaw-skinned variant of <see cref="ChatTimeline"/> from the vendored
@@ -102,6 +103,31 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
     // would re-pin the stale bottom row mid-growth and the view would land one row short.
     // Anchoring alone covers the in-place growth case that fires no reliable SizeChanged. See
     // issue #996 for the upstream (Reactor) port context.
+
+#if !OPENCLAW_TRAY_TESTS
+    /// <summary>
+    /// Product builds must NEVER force a synchronous layout pass from scroll
+    /// follow code. Tied to product compile, not billing lock — unlocking billing
+    /// must not re-enable LayoutCycle loops.
+    /// </summary>
+    private static bool SuppressForcedLayoutPasses => true;
+#else
+    private static bool SuppressForcedLayoutPasses => false;
+#endif
+
+    private static void SafeUpdateLayout(Microsoft.UI.Xaml.Controls.ScrollViewer sv)
+    {
+        if (SuppressForcedLayoutPasses)
+            return;
+        try
+        {
+            sv.UpdateLayout();
+        }
+        catch (Exception ex)
+        {
+            OpenClawTray.Services.Logger.Warn($"[ChatTimeline] UpdateLayout skipped: {ex.Message}");
+        }
+    }
 
     /// <summary>
     /// Static scroll-offset store shared across all timeline instances so that
@@ -578,27 +604,12 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
         // fine for the entry counts we deal with (typically <100 visible).
         var hoveredEntries = UseState<HashSet<string>>(new HashSet<string>(), threadSafe: true);
 
-        // Thinking-bubble dot animation. Cycles 0→1→2→3→0 while ShowThinkingIndicator
-        // is true. Keep the interval coarse: FunctionalUI remounts the timeline on
-        // each tick, and a stuck thinking state plus frequent remounts freezes input.
-        var (thinkingDotPhase, thinkingDotPhaseUpdate) = UseReducer<int>(0, threadSafe: true);
-        UseEffect((Func<Action>)(() =>
-        {
-            if (!Props.ShowThinkingIndicator)
-                return () => { };
-            var timer = new Microsoft.UI.Xaml.DispatcherTimer
-            {
-                Interval = TimeSpan.FromMilliseconds(2000)
-            };
-            timer.Tick += (_, _) =>
-            {
-                if (!Props.ShowThinkingIndicator)
-                    return;
-                thinkingDotPhaseUpdate(prev => (prev + 1) % 4);
-            };
-            timer.Start();
-            return () => timer.Stop();
-        }), Props.ShowThinkingIndicator);
+        // Thinking indicator: do NOT animate via UseReducer + DispatcherTimer.
+        // Each tick remounted the entire timeline (VirtualVStack + ScrollViewer
+        // SizeChanged → UpdateLayout) and produced LayoutCycleException after
+        // streamed/error turns — blanking Hub + tray. Static caption is enough.
+        var thinkingDotPhase = 3;
+        _ = thinkingDotPhase;
 
         // Acknowledged actions — set of "entryId|actionKey" strings briefly
         // marked after a click so the icon can swap to a checkmark for ~1.2s
@@ -723,7 +734,7 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
 
             void PinToBottom(bool passDisableAnimation)
             {
-                sv.UpdateLayout();
+                SafeUpdateLayout(sv);
                 var bottom = sv.ScrollableHeight;
                 sv.ChangeView(null, bottom, null, passDisableAnimation);
                 lastVerticalOffsetRef.Current = bottom;
@@ -775,7 +786,7 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
                 // reading position with a bottom pin. Explicit scroll-to-bottom requests (session
                 // switch, token bump, user sent a message) pass respectUserScrollPosition = false
                 // and always pin, since they ARE the user asking to jump to the newest row.
-                sv.UpdateLayout();
+                SafeUpdateLayout(sv);
                 if ((respectUserScrollPosition && UserScrolledAway()) || suppressAutoFollowRef.Current)
                 {
                     // Abandoning the follow: we are NOT at the bottom, so DISABLE anchoring rather
@@ -824,7 +835,7 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
                         return;
                     }
 
-                    sv.UpdateLayout();
+                    SafeUpdateLayout(sv);
 
                     // Re-check after layout: UpdateLayout can flush pending ViewChanged events
                     // (e.g. a user ChangeView that was queued but not yet dispatched).
@@ -916,7 +927,7 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
                 // Re-seat by the ACTUAL inserted height measured after layout (ScrollableHeight
                 // delta), not a stale precomputed value, so estimated-extent wobble during row
                 // realization can't leave the reader clamped to the bottom.
-                sv.UpdateLayout();
+                SafeUpdateLayout(sv);
                 var delta = sv.ScrollableHeight - oldScrollableHeight;
                 var target = ClampOffset(oldOffset + Math.Max(0, delta), sv.ScrollableHeight);
                 sv.ChangeView(null, target, null, disableAnimation: true);
@@ -1997,53 +2008,14 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
                         return;
                     }
 
+                    // External tool cards: Stretch + MaxWidth only. No SizeChanged
+                    // sync at all — even deferred MaxWidth updates still raced
+                    // scroll UpdateLayout and remounted thinking UI into
+                    // LayoutCycleException (crash.log 14:58).
                     b.MaxWidth = 720 - toolIndent;
-                    // Floor the tool card width so the 5-column header grid
-                    // (chevron / ⚡ / label / summary / status pill) doesn't
-                    // clip when the assistant reply is short (e.g. "Done.")
-                    // and the bubble sizes itself to 80–120 DIPs.
-                    b.MinWidth = 360;
-                    b.HorizontalAlignment = HorizontalAlignment.Left;
-
-                    // If an assistant bubble was rendered earlier in this turn,
-                    // bind the tool card's Width to the bubble's ActualWidth
-                    // minus the indent so the right edges stay parallel and
-                    // the tool card visually nests inside the bubble's reading
-                    // column — regardless of how the bubble's content sized it.
-                    var slotBubble = bubbleSlot != null ? bubbleSlot[0] : null;
-                    if (slotBubble != null)
-                    {
-                        void Sync()
-                        {
-                            var w = slotBubble.ActualWidth - toolIndent;
-                            // Clamp to MinWidth so the 5-column header grid
-                            // (chevron / ⚡ / label / summary / status pill)
-                            // never overflows when the assistant bubble is
-                            // narrow (e.g. "Done."). Without this clamp the
-                            // Star summary column shrinks to 0 but Auto
-                            // columns still take natural width, pushing the
-                            // status pill past the card's rounded-corner
-                            // clip and visually truncating "Done".
-                            if (w > 0) b.Width = Math.Max(360, w);
-                        }
-                        // Keep the SizeChanged subscription paired with the
-                        // card's lifetime: every re-render creates a fresh
-                        // Border, so without the Unloaded detach the bubble
-                        // would accumulate handlers on every timeline
-                        // re-render (one per turn). Capture the handler in
-                        // a local so we have a stable reference to remove.
-                        Microsoft.UI.Xaml.SizeChangedEventHandler onBubbleSize = (_, _) => Sync();
-                        b.Loaded += (_, _) =>
-                        {
-                            slotBubble.SizeChanged += onBubbleSize;
-                            Sync();
-                        };
-                        b.Unloaded += (_, _) =>
-                        {
-                            slotBubble.SizeChanged -= onBubbleSize;
-                        };
-                        Sync();
-                    }
+                    b.ClearValue(FrameworkElement.WidthProperty);
+                    b.ClearValue(FrameworkElement.MinWidthProperty);
+                    b.HorizontalAlignment = HorizontalAlignment.Stretch;
                 });
 
             // Wrap a finished card with the appropriate outer layout. In nested
@@ -2437,9 +2409,12 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
 
             // Error status — centered red pill (Kenny's Cat10 system-notice
             // pattern: small bordered capsule, tinted background, glyph + text).
+            // When the platform maps a recoverable LLM failure, offer a one-tap
+            // new-session control so end users are not told to type /new.
             ChatTimelineItemKind.Status when entry.Tone == ChatTone.Error =>
                 Border(
-                    Border(
+                    VStack(
+                        8,
                         (FlexRow(
                             Caption("⚠").Foreground(themeBrush("SystemFillColorCriticalBrush"))
                                 .Set(t => { t.FontSize = 12; })
@@ -2447,12 +2422,23 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
                             Caption(entry.Text).Foreground(themeBrush("SystemFillColorCriticalBrush"))
                                 .Set(t => { t.FontSize = 12; t.TextWrapping = TextWrapping.Wrap; })
                                 .VAlign(VerticalAlignment.Center)
-                        ) with { ColumnGap = 6 })
-                    ).Background(new SolidColorBrush(Color.FromArgb(0x2E, 0xC8, 0x32, 0x32)))  // crimson @ ~18%
-                     .CornerRadius(12)
-                     .Padding(10, 4, 10, 4)
-                     .HAlign(HorizontalAlignment.Center)
-                ).Margin(0, 4, 0, 4),
+                        ) with { ColumnGap = 6 }),
+                        Props.OnNewSession is not null
+                        && ProductPlatformBilling.SuggestsNewSessionRecovery(entry.Text)
+                            ? Button(
+                                    LocalizationHelper.GetString("Chat_Error_NewSessionAction"),
+                                    () => Props.OnNewSession())
+                                .HAlign(HorizontalAlignment.Center)
+                                .Set(b => Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(
+                                    b,
+                                    "ChatErrorNewSessionButton"))
+                            : Empty()
+                    )
+                ).Background(new SolidColorBrush(Color.FromArgb(0x2E, 0xC8, 0x32, 0x32)))  // crimson @ ~18%
+                 .CornerRadius(12)
+                 .Padding(10, 6, 10, 6)
+                 .HAlign(HorizontalAlignment.Center)
+                 .Margin(0, 4, 0, 4),
 
             // Generic status — small dim centered pill at 18% tint.
             ChatTimelineItemKind.Status =>
@@ -2828,6 +2814,16 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
                                         lastVerticalOffsetRef.Current = target;
                                         lastScrollableHeightRef.Current = sv.ScrollableHeight;
                                         suppressAutoFollowRef.Current = false;
+                                        return;
+                                    }
+
+                                    // Product: SizeChanged → QueueScrollToBottom → UpdateLayout
+                                    // is the proven LayoutCycleException loop. Keep sticky follow
+                                    // via VerticalAnchorRatio only; never re-enter layout here.
+                                    if (SuppressForcedLayoutPasses)
+                                    {
+                                        if (suppressAutoFollowRef.Current)
+                                            suppressAutoFollowRef.Current = false;
                                         return;
                                     }
 

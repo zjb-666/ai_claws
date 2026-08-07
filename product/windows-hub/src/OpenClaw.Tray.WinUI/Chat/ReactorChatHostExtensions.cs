@@ -38,7 +38,8 @@ public static class ReactorChatHostExtensions
         Action? onSettingsClick = null,
         Action<bool>? onSpeakerMuteChanged = null,
         bool initialMuted = false,
-        bool isCompact = false)
+        bool isCompact = false,
+        Func<string?, Task<bool>>? onChannelSetupIntent = null)
     {
         ArgumentNullException.ThrowIfNull(window);
         ArgumentNullException.ThrowIfNull(target);
@@ -84,7 +85,8 @@ public static class ReactorChatHostExtensions
             onSpeakerMuteChanged,
             ConfirmResetAsync,
             initialMuted,
-            isCompact);
+            isCompact,
+            onChannelSetupIntent);
         var host = new ReactorHostControl();
         host.Mount(_ => Component<OpenClawReactorChatRoot, OpenClawReactorChatRootProps>(props));
         target.Child = host;

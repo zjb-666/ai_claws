@@ -2853,6 +2853,12 @@
   <data name="Chat_PendingNewSessionTitle" xml:space="preserve">
     <value>新工作階段</value>
   </data>
+  <data name="Chat_Composer_Tooltip_NewSession" xml:space="preserve">
+    <value>新建工作階段</value>
+  </data>
+  <data name="Chat_Error_NewSessionAction" xml:space="preserve">
+    <value>新建工作階段</value>
+  </data>
   <data name="Chat_Status_Running" xml:space="preserve">
     <value>執行中</value>
   </data>
@@ -3669,6 +3675,12 @@
   </data>
   <data name="ChannelsPage_Refresh.Text" xml:space="preserve">
     <value>重新整理</value>
+  </data>
+  <data name="ChannelsPage_SetupWizard.Text" xml:space="preserve">
+    <value>通道精靈</value>
+  </data>
+  <data name="ChannelsPage_OpenSetupWizard" xml:space="preserve">
+    <value>開啟官方通道精靈</value>
   </data>
   <data name="ChannelsPage_ConfiguredHeader.Text" xml:space="preserve">
     <value>已設定</value>

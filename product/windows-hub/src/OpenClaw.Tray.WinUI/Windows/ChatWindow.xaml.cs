@@ -408,6 +408,21 @@ public sealed partial class ChatWindow : WindowEx
         WebView.CoreWebView2?.Navigate(_chatUrl);
     }
 
+    internal void RemountChatAfterLayoutFault()
+    {
+        try
+        {
+            Logger.Warn("[ChatWindow] Remounting chat surface after layout fault");
+            DisposeReactorHost();
+            _mountedProvider = null;
+            ApplyChatSurface();
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn($"[ChatWindow] Remount after layout fault failed: {ex.Message}");
+        }
+    }
+
     private void TryMountReactorChat()
     {
         var app = App.Current as App;
@@ -445,7 +460,12 @@ public sealed partial class ChatWindow : WindowEx
             onSettingsClick: () => appInstance?.ShowHub("voice"),
             onSpeakerMuteChanged: muted => _ = OnSpeakerMuteChangedAsync(muted),
             initialMuted: ShouldStartSpeakerMuted(appInstance?.Settings),
-            isCompact: true);
+            isCompact: true,
+            onChannelSetupIntent: channelId =>
+            {
+                appInstance?.StartChannelSetupWizard(channelId);
+                return Task.FromResult(true);
+            });
         _mountedProvider = provider;
         UpdateNativeChatSurfaceActive();
     }

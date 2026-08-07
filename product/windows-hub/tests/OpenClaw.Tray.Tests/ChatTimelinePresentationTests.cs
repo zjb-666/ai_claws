@@ -60,17 +60,20 @@ public sealed class ChatTimelinePresentationTests
             "ReactorItemsViewScrollController.cs"));
 
         Assert.Contains("itemsView.Loaded += OnLoaded", binding);
-        Assert.Contains("itemsView.LayoutUpdated += OnLayoutUpdated", binding);
         Assert.Contains("itemsView.DispatcherQueue.TryEnqueue", binding);
-        Assert.Contains("itemsView.StartBringItemIntoView(", binding);
-        Assert.Contains("VerticalAlignmentRatio = 1.0", binding);
+        Assert.Contains("scrollView.ScrollTo(", binding);
+        Assert.Contains("ScrollingAnimationMode.Disabled", binding);
         Assert.Contains("_valid = tailIndex >= 0", binding);
         Assert.Contains("itemsView.Unloaded += OnUnloaded", binding);
         Assert.Contains("itemsView.Loaded -= OnLoaded", binding);
-        Assert.Contains("itemsView.LayoutUpdated -= OnLayoutUpdated", binding);
+        // Layout-pass / sticky-anchor feedback loops are the proven LayoutCycle drivers.
+        Assert.DoesNotContain("LayoutUpdated +=", binding);
+        Assert.DoesNotContain("LayoutUpdated -=", binding);
         Assert.DoesNotContain("ChangeView", binding);
         Assert.DoesNotContain("UpdateLayout", binding);
-        Assert.Contains("scrollView.VerticalAnchorRatio = _following ? 1.0 : double.NaN", binding);
+        Assert.DoesNotContain("StartBringItemIntoView(", binding);
+        Assert.DoesNotContain("VerticalAnchorRatio", binding);
+        Assert.Contains("QueueOneShotPin", binding);
     }
 
     [Fact]

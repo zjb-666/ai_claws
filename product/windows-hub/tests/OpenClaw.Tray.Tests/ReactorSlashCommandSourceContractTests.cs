@@ -26,7 +26,8 @@ public class ReactorSlashCommandSourceContractTests
             "ChatLifecycleCommandParser.TryParse(message, attachments.Count > 0, out var command)",
             "ChatLifecycleCommandExecutionPolicy.ShouldQueue(command)",
             "native.ExecuteLifecycleCommandAsync(threadId, command)",
-            "provider.SendMessageAsync(threadId, message, CancellationToken.None, attachments)");
+            "ChannelSetupIntent.TryParse(message, out var channelId)",
+            "provider.SendMessageAsync(sendThreadId, message, CancellationToken.None, attachments)");
     }
 
     [Fact]

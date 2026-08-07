@@ -224,6 +224,23 @@ public sealed partial class ChatPage : Page
             : null;
     }
 
+    internal void RemountChatAfterLayoutFault()
+    {
+        // Tear down the poisoned Reactor tree so Hub/chat can paint again after
+        // LayoutCycleException. Provider stays connected; only the visual remounts.
+        try
+        {
+            Logger.Warn("[ChatPage] Remounting chat surface after layout fault");
+            DisposeReactorHost();
+            _mountedProvider = null;
+            ApplyChatSurface();
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn($"[ChatPage] Remount after layout fault failed: {ex.Message}");
+        }
+    }
+
     private void ShowReactorSurface()
     {
         // Hide WebView2-specific UI; mount the Reactor host (idempotent).
@@ -303,7 +320,12 @@ public sealed partial class ChatPage : Page
                 onAttachClick: OnAttachClicked,
                 onSettingsClick: () => _hub?.NavigateTo("voice"),
                 onSpeakerMuteChanged: muted => _ = OnSpeakerMuteChangedAsync(muted),
-                initialMuted: ShouldStartSpeakerMuted(CurrentApp.Settings));
+                initialMuted: ShouldStartSpeakerMuted(CurrentApp.Settings),
+                onChannelSetupIntent: channelId =>
+                {
+                    CurrentApp.StartChannelSetupWizard(channelId);
+                    return Task.FromResult(true);
+                });
             _mountedProvider = provider;
             _mountedThreadId = threadIdToMount;
             UpdateNativeChatSurfaceActive();

@@ -98,8 +98,24 @@ public sealed partial class WizardPage : Page
 
     protected override void OnNavigatedFrom(NavigationEventArgs e)
     {
-        _ = DisconnectAsync();
+        // Cancel the gateway session so a later wizard.start is not rejected
+        // with "wizard already running" after the host window closes.
+        _ = CancelCurrentSessionAsync();
     }
+
+    private object? BuildWizardStartParameters()
+    {
+        if (!IsChannelsFlow(_config))
+            return null;
+
+        return string.IsNullOrWhiteSpace(_config.WizardChannel)
+            ? new { flow = "channels" }
+            : new { flow = "channels", channel = _config.WizardChannel.Trim() };
+    }
+
+    private static bool IsChannelsFlow(SetupConfig? config) =>
+        config is not null
+        && string.Equals(config.WizardFlow, "channels", StringComparison.OrdinalIgnoreCase);
 
     private async Task StartWizardAsync(bool clearTranscript = true)
     {
@@ -125,7 +141,10 @@ public sealed partial class WizardPage : Page
             _client.StatusChanged += OnWizardClientStatusChanged;
             SetBusy("Starting wizard...");
             StartConsoleTail();
-            var payload = await _client.SendWizardRequestAsync("wizard.start", timeoutMs: 30_000);
+            var payload = await _client.SendWizardRequestAsync(
+                "wizard.start",
+                BuildWizardStartParameters(),
+                timeoutMs: 30_000);
             if (generation != _operationGeneration)
                 return;
 
@@ -1434,6 +1453,20 @@ public sealed partial class WizardPage : Page
     {
         if (generation != _operationGeneration || _errorState)
             return;
+
+        // Channel setup (Hub / Control UI parity): no Windows-node finalization.
+        if (IsChannelsFlow(_config))
+        {
+            TitleText.Text = "Channel setup complete";
+            StatusText.Text = "You can close this window.";
+            BusyRing.IsActive = false;
+            BusyRing.Visibility = Visibility.Collapsed;
+            PrimaryButton.Content = "Done";
+            PrimaryButton.IsEnabled = true;
+            SecondaryButton.Visibility = Visibility.Collapsed;
+            _config!.OnWizardCompleted?.Invoke();
+            return;
+        }
 
         var setupWindow = SetupWindow.Active;
         if (setupWindow is null or { IsClosed: true })
